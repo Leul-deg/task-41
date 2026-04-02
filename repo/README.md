@@ -177,6 +177,8 @@ Prerequisites for one-click run:
 
 - Python 3 (or Python) for API suite
 - Go toolchain for native unit tests OR Docker (runner auto-fallback)
+- Native unit tests require Go `1.23+` (older versions fail on current backend/frontend modules).
+- To always run unit tests in the Go container, set `MERIDIAN_USE_DOCKER_GO=1` (Docker required).
 - Running app endpoints at `http://localhost:8081` (configure via `TEST_BASE_URL` if different)
 
 One-click command (from project root):

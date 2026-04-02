@@ -49,7 +49,7 @@ func TestGetTicket_DeniesOutsideSiteScope(t *testing.T) {
 	}
 }
 
-func TestListOrders_FiltersToSiteForNonGlobalScope(t *testing.T) {
+func TestSupportListOrders_FiltersToSiteForNonGlobalScope(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	db, mock, _ := sqlmock.New()
 	defer db.Close()
@@ -89,7 +89,7 @@ func TestListOrders_FiltersToSiteForNonGlobalScope(t *testing.T) {
 	}
 }
 
-func TestListOrders_GlobalScopeReturnsOrders(t *testing.T) {
+func TestSupportListOrders_GlobalScopeReturnsOrders(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	db, mock, _ := sqlmock.New()
 	defer db.Close()
