@@ -1,0 +1,73 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-meridian}
+      POSTGRES_USER: ${POSTGRES_USER:-meridian}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-meridian}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-meridian} -d ${POSTGRES_DB:-meridian}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  backend-api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgres://meridian:meridian@postgres:5432/meridian?sslmode=disable}
+      JWT_SECRET: ${JWT_SECRET:-change-this-jwt-secret}
+      ACCESS_TOKEN_TTL_MIN: ${ACCESS_TOKEN_TTL_MIN:-15}
+      REFRESH_TOKEN_TTL_HOURS: ${REFRESH_TOKEN_TTL_HOURS:-168}
+      STEP_UP_TTL_MIN: ${STEP_UP_TTL_MIN:-5}
+      DEFAULT_ADMIN_USERNAME: ${DEFAULT_ADMIN_USERNAME:-admin}
+      DEFAULT_ADMIN_PASSWORD: ${DEFAULT_ADMIN_PASSWORD:-LocalAdminPass123!}
+      BOOTSTRAP_CLIENT_KEY: ${BOOTSTRAP_CLIENT_KEY:-local-h5}
+      BOOTSTRAP_CLIENT_SECRET: ${BOOTSTRAP_CLIENT_SECRET:-local-h5-secret-change-me}
+      IDEMPOTENCY_TTL_HOURS: ${IDEMPOTENCY_TTL_HOURS:-48}
+      ENABLE_FUZZY_DEDUP: ${ENABLE_FUZZY_DEDUP:-true}
+      PII_KEY_NAME: ${PII_KEY_NAME:-PII_DEFAULT}
+      PII_KEY_VALUE: ${PII_KEY_VALUE:-change-this-local-pii-key}
+      PORT: 8080
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  backend-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: ["/app/worker"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgres://meridian:meridian@postgres:5432/meridian?sslmode=disable}
+      PORT: 8090
+    depends_on:
+      postgres:
+        condition: service_healthy
+      backend-api:
+        condition: service_started
+
+  frontend-web:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    environment:
+      FRONTEND_PORT: 8081
+      BACKEND_BASE_URL: http://backend-api:8080
+      H5_CLIENT_KEY: ${BOOTSTRAP_CLIENT_KEY:-local-h5}
+      H5_CLIENT_SECRET: ${BOOTSTRAP_CLIENT_SECRET:-local-h5-secret-change-me}
+    ports:
+      - "8081:8081"
+    depends_on:
+      backend-api:
+        condition: service_started
+
+volumes:
+  pgdata:
