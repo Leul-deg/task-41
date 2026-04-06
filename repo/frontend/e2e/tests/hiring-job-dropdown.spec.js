@@ -10,8 +10,19 @@ async function login(page, username) {
   await expect(page).toHaveURL(/\/dashboard$/);
 }
 
+async function mockApplications(page) {
+  await page.route("**/rpc/api/hiring/applications", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ applications: [] }),
+    });
+  });
+}
+
 test("hiring dropdown loads jobs successfully", async ({ page }) => {
   await login(page, "admin");
+  await mockApplications(page);
 
   await page.route("**/rpc/api/hiring/jobs", async (route) => {
     await route.fulfill({
@@ -28,6 +39,7 @@ test("hiring dropdown loads jobs successfully", async ({ page }) => {
 
 test("hiring dropdown empty list state disables actions", async ({ page }) => {
   await login(page, "admin");
+  await mockApplications(page);
 
   await page.route("**/rpc/api/hiring/jobs", async (route) => {
     await route.fulfill({
@@ -46,8 +58,18 @@ test("hiring dropdown empty list state disables actions", async ({ page }) => {
 
 test("hiring dropdown shows access denied on 403", async ({ page }) => {
   await login(page, "admin");
+  await mockApplications(page);
 
-  await page.route("**/rpc/api/hiring/jobs", async (route) => {
+  await page.route("**/rpc/api/hiring/jobs*", async (route) => {
+    const url = route.request().url();
+    if (url.includes("/for-intake")) {
+      await route.fulfill({
+        status: 403,
+        contentType: "application/json",
+        body: JSON.stringify({ error: "forbidden", code: "FORBIDDEN_SCOPE" }),
+      });
+      return;
+    }
     await route.fulfill({
       status: 403,
       contentType: "application/json",
@@ -63,6 +85,7 @@ test("hiring dropdown shows access denied on 403", async ({ page }) => {
 
 test("hiring dropdown shows session-expired state on 401", async ({ page }) => {
   await login(page, "admin");
+  await mockApplications(page);
 
   await page.route("**/rpc/api/hiring/jobs", async (route) => {
     await route.fulfill({
@@ -79,6 +102,7 @@ test("hiring dropdown shows session-expired state on 401", async ({ page }) => {
 
 test("hiring dropdown retry recovers from transient failure", async ({ page }) => {
   await login(page, "admin");
+  await mockApplications(page);
 
   let hit = 0;
   await page.route("**/rpc/api/hiring/jobs", async (route) => {

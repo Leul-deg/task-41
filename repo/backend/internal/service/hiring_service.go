@@ -8,18 +8,21 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"unicode"
 
 	"github.com/google/uuid"
 	"meridian/backend/internal/domain/hiring"
+	"meridian/backend/internal/platform/security"
 )
 
 type HiringService struct {
 	DB               *sql.DB
 	EnableFuzzyDedup bool
+	PII              *security.PIIProtector
 }
 
-func NewHiringService(db *sql.DB, enableFuzzy bool) *HiringService {
-	return &HiringService{DB: db, EnableFuzzyDedup: enableFuzzy}
+func NewHiringService(db *sql.DB, enableFuzzy bool, pii *security.PIIProtector) *HiringService {
+	return &HiringService{DB: db, EnableFuzzyDedup: enableFuzzy, PII: pii}
 }
 
 func (s *HiringService) ValidateDefinition(stages []map[string]any, transitions []map[string]any) error {
@@ -173,22 +176,44 @@ func (s *HiringService) EvaluateBlocklist(email, fullName string, hasDuplicate b
 	return severity, triggers, nil
 }
 
-func (s *HiringService) ScoreDuplicate(identityKey, name string) (int, []string, error) {
+func (s *HiringService) ScoreDuplicate(identityValue, name string) (int, []string, error) {
 	risk := 0
 	triggers := []string{}
-	var existingID string
-	err := s.DB.QueryRow(`SELECT candidate_id FROM candidate_identities WHERE identity_key=$1 LIMIT 1`, identityKey).Scan(&existingID)
-	if err == nil {
-		risk += 90
-		triggers = append(triggers, "exact_identity")
+	tokens, err := s.identityLookupTokens(identityValue)
+	if err != nil {
+		return risk, triggers, err
+	}
+	for _, token := range tokens {
+		var existingID string
+		err := s.DB.QueryRow(`SELECT candidate_id FROM candidate_identities WHERE identity_key=$1 LIMIT 1`, token).Scan(&existingID)
+		if err == nil {
+			risk += 90
+			triggers = append(triggers, "exact_identity")
+			break
+		}
 	}
 
 	if s.EnableFuzzyDedup {
-		var count int
-		_ = s.DB.QueryRow(`SELECT COUNT(*) FROM candidates WHERE lower(full_name) LIKE $1`, strings.ToLower(prefix(name))+"%").Scan(&count)
-		if count > 0 {
-			risk += 15
-			triggers = append(triggers, "fuzzy_name_prefix")
+		nameTokens, tokenErr := s.nameLookupTokens(name)
+		if tokenErr != nil {
+			return risk, triggers, tokenErr
+		}
+		for _, token := range nameTokens {
+			var count int
+			_ = s.DB.QueryRow(`SELECT COUNT(*) FROM candidates WHERE name_search_token=$1`, token).Scan(&count)
+			if count > 0 {
+				risk += 15
+				triggers = append(triggers, "fuzzy_name_prefix")
+				break
+			}
+		}
+		if !containsTrigger(triggers, "fuzzy_name_prefix") {
+			var count int
+			_ = s.DB.QueryRow(`SELECT COUNT(*) FROM candidates WHERE lower(full_name) LIKE $1`, strings.ToLower(prefix(name))+"%").Scan(&count)
+			if count > 0 {
+				risk += 15
+				triggers = append(triggers, "fuzzy_name_prefix")
+			}
 		}
 	}
 
@@ -218,13 +243,32 @@ func (s *HiringService) ImportCSV(jobID string, r io.Reader) (int, error) {
 		phone := onlyDigits(rows[i][2])
 		candidateID := uuid.NewString()
 		appID := uuid.NewString()
-		identity := email + "|" + phone
+		identity, err := s.IdentityToken(email, phone)
+		if err != nil {
+			return created, err
+		}
+		nameToken, err := s.NameSearchToken(fullName)
+		if err != nil {
+			return created, err
+		}
+		encFullName, err := s.encryptCandidateValue(fullName)
+		if err != nil {
+			return created, err
+		}
+		encEmail, err := s.encryptCandidateValue(email)
+		if err != nil {
+			return created, err
+		}
+		encPhone, err := s.encryptCandidateValue(phone)
+		if err != nil {
+			return created, err
+		}
 
 		tx, err := s.DB.Begin()
 		if err != nil {
 			return created, err
 		}
-		_, err = tx.Exec(`INSERT INTO candidates(id, full_name, email, phone, created_at) VALUES ($1,$2,$3,$4,now())`, candidateID, fullName, email, phone)
+		_, err = tx.Exec(`INSERT INTO candidates(id, full_name, email, phone, name_search_token, created_at) VALUES ($1,$2,$3,$4,$5,now())`, candidateID, encFullName, encEmail, encPhone, nameToken)
 		if err != nil {
 			tx.Rollback()
 			continue
@@ -387,4 +431,239 @@ func escape(s string) string {
 	s = strings.ReplaceAll(s, "\\", "\\\\")
 	s = strings.ReplaceAll(s, "\"", "\\\"")
 	return s
+}
+
+func (s *HiringService) IdentityToken(email, phone string) (string, error) {
+	raw := strings.ToLower(strings.TrimSpace(email)) + "|" + onlyDigits(phone)
+	if s.PII != nil {
+		return s.PII.DeterministicToken(raw)
+	}
+	return security.HashOpaqueToken(raw), nil
+}
+
+func (s *HiringService) NameSearchToken(name string) (string, error) {
+	raw := strings.ToLower(prefix(name))
+	if s.PII != nil {
+		return s.PII.DeterministicToken(raw)
+	}
+	return security.HashOpaqueToken(raw), nil
+}
+
+func (s *HiringService) encryptCandidateValue(value string) (string, error) {
+	if s.PII == nil {
+		return value, nil
+	}
+	return s.PII.Encrypt(value)
+}
+
+func (s *HiringService) RemediateLegacyIdentityData() error {
+	if s.DB == nil || s.PII == nil {
+		return nil
+	}
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.Query(`
+		SELECT id::text, identity_key
+		FROM candidate_identities
+		WHERE COALESCE(identity_key,'') <> ''
+		ORDER BY created_at ASC
+	`)
+	if err != nil {
+		return err
+	}
+	type identityRow struct {
+		id    string
+		value string
+	}
+	identityRows := []identityRow{}
+	for rows.Next() {
+		var row identityRow
+		if rows.Scan(&row.id, &row.value) == nil {
+			identityRows = append(identityRows, row)
+		}
+	}
+	rows.Close()
+
+	for _, row := range identityRows {
+		if strings.HasPrefix(row.value, "tk") || looksLegacyDeterministicToken(row.value) {
+			continue
+		}
+		token, err := s.PII.DeterministicToken(row.value)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`UPDATE candidate_identities SET identity_key=$2 WHERE id=$1::uuid`, row.id, token); err != nil {
+			return err
+		}
+	}
+
+	nameRows, err := tx.Query(`
+		SELECT id::text, full_name, COALESCE(email,''), COALESCE(phone,''), COALESCE(name_search_token,'')
+		FROM candidates
+		WHERE COALESCE(full_name,'') <> ''
+		   OR COALESCE(email,'') <> ''
+		   OR COALESCE(phone,'') <> ''
+		   OR COALESCE(name_search_token,'') = ''
+		ORDER BY created_at ASC
+	`)
+	if err != nil {
+		return err
+	}
+	type nameRow struct {
+		id         string
+		fullName   string
+		email      string
+		phone      string
+		nameToken  string
+	}
+	candidates := []nameRow{}
+	for nameRows.Next() {
+		var row nameRow
+		if nameRows.Scan(&row.id, &row.fullName, &row.email, &row.phone, &row.nameToken) == nil {
+			candidates = append(candidates, row)
+		}
+	}
+	nameRows.Close()
+
+	for _, row := range candidates {
+		nameValue, encFullName, err := s.normalizeLegacyCandidateValue(row.fullName)
+		if err != nil {
+			return err
+		}
+		_, encEmail, err := s.normalizeLegacyCandidateValue(row.email)
+		if err != nil {
+			return err
+		}
+		_, encPhone, err := s.normalizeLegacyCandidateValue(row.phone)
+		if err != nil {
+			return err
+		}
+
+		token := row.nameToken
+		if strings.TrimSpace(token) == "" && strings.TrimSpace(nameValue) != "" {
+			token, err = s.NameSearchToken(nameValue)
+			if err != nil {
+				return err
+			}
+		}
+		if _, err := tx.Exec(`
+			UPDATE candidates
+			SET full_name=$2, email=$3, phone=$4, name_search_token=$5
+			WHERE id=$1::uuid
+		`, row.id, encFullName, encEmail, encPhone, token); err != nil {
+			return err
+		}
+	}
+
+	verifyRows, err := tx.Query(`
+		SELECT COALESCE(full_name,''), COALESCE(email,''), COALESCE(phone,'')
+		FROM candidates
+	`)
+	if err != nil {
+		return err
+	}
+	remainingLegacy := 0
+	for verifyRows.Next() {
+		var fullName, email, phone string
+		if verifyRows.Scan(&fullName, &email, &phone) != nil {
+			continue
+		}
+		for _, value := range []string{fullName, email, phone} {
+			trimmed := strings.TrimSpace(value)
+			if trimmed == "" {
+				continue
+			}
+			if !s.PII.IsEncryptedValue(trimmed) {
+				remainingLegacy++
+				break
+			}
+		}
+	}
+	verifyRows.Close()
+	if remainingLegacy > 0 {
+		return fmt.Errorf("legacy candidate contact remediation incomplete: %d plaintext rows remain", remainingLegacy)
+	}
+
+	return tx.Commit()
+}
+
+func (s *HiringService) identityLookupTokens(identityValue string) ([]string, error) {
+	return uniqueNonEmptyStrings(append([]string{strings.TrimSpace(identityValue), security.HashOpaqueToken(identityValue)}, s.piiLookupTokens(identityValue)...)), nil
+}
+
+func (s *HiringService) nameLookupTokens(name string) ([]string, error) {
+	base := strings.ToLower(prefix(name))
+	return uniqueNonEmptyStrings(append([]string{security.HashOpaqueToken(base)}, s.piiLookupTokens(base)...)), nil
+}
+
+func (s *HiringService) piiLookupTokens(value string) []string {
+	if s.PII == nil {
+		return nil
+	}
+	out := []string{}
+	if versioned, err := s.PII.DeterministicTokens(value); err == nil {
+		out = append(out, versioned...)
+	}
+	if legacy, err := s.PII.LegacyDeterministicTokens(value); err == nil {
+		out = append(out, legacy...)
+	}
+	return out
+}
+
+func uniqueNonEmptyStrings(values []string) []string {
+	seen := map[string]bool{}
+	out := []string{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	return out
+}
+
+func containsTrigger(triggers []string, needle string) bool {
+	for _, trigger := range triggers {
+		if trigger == needle {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *HiringService) normalizeLegacyCandidateValue(value string) (plain string, encrypted string, err error) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return "", "", nil
+	}
+	if s.PII.IsEncryptedValue(trimmed) {
+		plain, err = s.PII.Decrypt(trimmed)
+		if err != nil {
+			return "", "", err
+		}
+		return plain, trimmed, nil
+	}
+	encrypted, err = s.encryptCandidateValue(trimmed)
+	if err != nil {
+		return "", "", err
+	}
+	return trimmed, encrypted, nil
+}
+
+func looksLegacyDeterministicToken(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	for _, r := range value {
+		if !unicode.IsDigit(r) && (r < 'a' || r > 'f') && (r < 'A' || r > 'F') {
+			return false
+		}
+	}
+	return true
 }

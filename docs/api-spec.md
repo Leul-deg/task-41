@@ -43,7 +43,7 @@ Health check **`GET /healthz`** is **unsigned**.
 
 | Surface | Auth |
 | :--- | :--- |
-| `POST /auth/login`, `POST /auth/refresh` | **No** JWT; JSON body with credentials / refresh token |
+| `POST /auth/login`, `POST /auth/refresh` | Signing required; **No** JWT; JSON body with credentials / refresh token |
 | `GET /kiosk/jobs`, `POST /kiosk/applications` | Signing + `X-Kiosk-Token` (no staff JWT) |
 | `POST /api/auth/step-up`, `GET /api/auth/me` | Signing + `Authorization: Bearer <access_jwt>` |
 | All other `/api/*` | Signing + Bearer access JWT |
@@ -91,8 +91,8 @@ Enforcement is via `RequirePermission` and `RequireScope` middleware on route gr
 
 | Method | Path | Signing | JWT | Description |
 | :--- | :--- | :--- | :--- | :--- |
-| `POST` | `/auth/login` | No | No | Body: `username`, `password` (min 12 chars). Returns `access_token`, `refresh_token`. Lockout after 5 failures / 15 minutes. |
-| `POST` | `/auth/refresh` | No | No | Body: `refresh_token`. Returns `access_token`. |
+| `POST` | `/auth/login` | Yes | No | Body: `username`, `password` (min 12 chars). Returns `access_token`, `refresh_token`. Lockout after 5 failures / 15 minutes. |
+| `POST` | `/auth/refresh` | Yes | No | Body: `refresh_token`. Returns `access_token`. |
 | `POST` | `/api/auth/step-up` | Yes | Yes | Re-verify password; returns `step_up_token`. |
 | `GET` | `/api/auth/me` | Yes | Yes | Current user `id`, `username`, `roles`, `permissions`, `scopes`. |
 
@@ -198,7 +198,7 @@ All routes: signing + JWT + permission/scope as noted.
 
 ## 11. Representative request examples
 
-### Login (no signing)
+### Login (signed)
 
 `POST /auth/login`
 

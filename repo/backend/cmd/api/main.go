@@ -14,6 +14,7 @@ import (
 	"meridian/backend/internal/http/middleware"
 	"meridian/backend/internal/platform/db"
 	"meridian/backend/internal/platform/security"
+	"meridian/backend/internal/service"
 )
 
 func main() {
@@ -45,9 +46,12 @@ func main() {
 	if err := pii.EnsureBootstrapKey(); err != nil {
 		log.Fatalf("pii key bootstrap failed: %v", err)
 	}
-	authHandler := handlers.NewAuthHandler(database, tokens, cfg.AccessTTL, cfg.RefreshTTL, cfg.StepUpTTL)
+	if err := service.NewHiringService(database, cfg.EnableFuzzyDedup, pii).RemediateLegacyIdentityData(); err != nil {
+		log.Fatalf("legacy hiring identity remediation failed: %v", err)
+	}
+	authHandler := handlers.NewAuthHandler(database, tokens, pii, cfg.AccessTTL, cfg.RefreshTTL, cfg.StepUpTTL)
 	hiringHandler := handlers.NewHiringHandler(database, cfg.EnableFuzzyDedup, pii)
-	supportHandler := handlers.NewSupportHandler(database)
+	supportHandler := handlers.NewSupportHandler(database, pii)
 	inventoryHandler := handlers.NewInventoryHandler(database)
 	adminHandler := handlers.NewAdminHandler(database)
 	complianceHandler := handlers.NewComplianceHandler(database)
@@ -57,8 +61,8 @@ func main() {
 		c.JSON(http.StatusOK, gin.H{"ok": true})
 	})
 
-	r.POST("/auth/login", authHandler.Login)
-	r.POST("/auth/refresh", authHandler.Refresh)
+	r.POST("/auth/login", middleware.RequireSignedRequests(database), authHandler.Login)
+	r.POST("/auth/refresh", middleware.RequireSignedRequests(database), authHandler.Refresh)
 	r.GET("/kiosk/jobs",
 		middleware.RequireSignedRequests(database),
 		middleware.RequireKioskToken(cfg.KioskSubmitSecret),

@@ -22,7 +22,7 @@ type HiringHandler struct {
 }
 
 func NewHiringHandler(db *sql.DB, enableFuzzy bool, pii *security.PIIProtector) *HiringHandler {
-	return &HiringHandler{DB: db, Svc: service.NewHiringService(db, enableFuzzy), PII: pii}
+	return &HiringHandler{DB: db, Svc: service.NewHiringService(db, enableFuzzy, pii), PII: pii}
 }
 
 type hiringAccess struct {
@@ -196,7 +196,7 @@ func (h *HiringHandler) CreateJob(c *gin.Context) {
 		VALUES ($1,$2,$3,$4,$5,now())
 	`, id, req.Code, req.Title, req.Description, req.SiteCode)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "job create failed", "detail": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "job create failed"})
 		return
 	}
 	if _, err = h.DB.Exec(`
@@ -312,6 +312,9 @@ func (h *HiringHandler) ListApplications(c *gin.Context) {
 		var createdAt time.Time
 		var risk int
 		if rows.Scan(&appID, &jobID, &stage, &source, &createdAt, &candidateID, &fullName, &email, &phone, &risk, &triggers) == nil {
+			fullName = h.decryptCandidateValue(fullName)
+			email = h.decryptCandidateValue(email)
+			phone = h.decryptCandidateValue(phone)
 			out = append(out, gin.H{
 				"application_id": appID,
 				"job_id":         jobID,
@@ -454,7 +457,7 @@ func (h *HiringHandler) UpdatePipelineTemplate(c *gin.Context) {
 
 	_, err = tx.Exec(`UPDATE pipeline_templates SET code=$2, name=$3 WHERE id=$1::uuid`, id, req.Code, req.Name)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "template update failed", "detail": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "template update failed"})
 		return
 	}
 	_, _ = tx.Exec(`DELETE FROM pipeline_transitions WHERE template_id=$1::uuid`, id)
@@ -473,7 +476,7 @@ func (h *HiringHandler) UpdatePipelineTemplate(c *gin.Context) {
 			toString(st["required_fields"]),
 		)
 		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "stage update failed", "detail": err.Error()})
+			c.JSON(http.StatusBadRequest, gin.H{"error": "stage update failed"})
 			return
 		}
 	}
@@ -489,7 +492,7 @@ func (h *HiringHandler) UpdatePipelineTemplate(c *gin.Context) {
 			toString(tr["screening_rule"]),
 		)
 		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "transition update failed", "detail": err.Error()})
+			c.JSON(http.StatusBadRequest, gin.H{"error": "transition update failed"})
 			return
 		}
 	}
@@ -523,8 +526,13 @@ func (h *HiringHandler) createApplication(c *gin.Context, source string) {
 		return
 	}
 
-	identityKey := strings.ToLower(strings.TrimSpace(req.Email)) + "|" + normalizePhone(req.Phone)
-	risk, dupTriggers, _ := h.Svc.ScoreDuplicate(identityKey, req.FullName)
+	rawIdentity := strings.ToLower(strings.TrimSpace(req.Email)) + "|" + normalizePhone(req.Phone)
+	risk, dupTriggers, _ := h.Svc.ScoreDuplicate(rawIdentity, req.FullName)
+	identityKey, err := h.Svc.IdentityToken(req.Email, req.Phone)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to tokenize candidate identity"})
+		return
+	}
 	sev, blockTriggers, err := h.Svc.EvaluateBlocklist(req.Email, req.FullName, risk > 0)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "blocklist evaluation failed"})
@@ -579,6 +587,26 @@ func (h *HiringHandler) createApplication(c *gin.Context, source string) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to encrypt sensitive data"})
 		return
 	}
+	encFullName, err := h.encryptCandidateValue(req.FullName)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to encrypt sensitive data"})
+		return
+	}
+	encEmail, err := h.encryptCandidateValue(strings.ToLower(req.Email))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to encrypt sensitive data"})
+		return
+	}
+	encPhone, err := h.encryptCandidateValue(normalizePhone(req.Phone))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to encrypt sensitive data"})
+		return
+	}
+	nameToken, err := h.Svc.NameSearchToken(req.FullName)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to tokenize candidate name"})
+		return
+	}
 
 	tx, err := h.DB.Begin()
 	if err != nil {
@@ -590,17 +618,17 @@ func (h *HiringHandler) createApplication(c *gin.Context, source string) {
 	candidateID := uuid.NewString()
 	applicationID := uuid.NewString()
 	_, err = tx.Exec(`
-		INSERT INTO candidates(id, full_name, email, phone, ssn_raw, created_at)
-		VALUES ($1,$2,$3,$4,$5,now())
-	`, candidateID, req.FullName, strings.ToLower(req.Email), normalizePhone(req.Phone), encSSN)
+		INSERT INTO candidates(id, full_name, email, phone, ssn_raw, name_search_token, created_at)
+		VALUES ($1,$2,$3,$4,$5,$6,now())
+	`, candidateID, encFullName, encEmail, encPhone, encSSN, nameToken)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "candidate create failed", "detail": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "candidate create failed"})
 		return
 	}
 
 	_, err = tx.Exec(`INSERT INTO candidate_identities(id, candidate_id, identity_key, created_at) VALUES ($1,$2,$3,now())`, uuid.NewString(), candidateID, identityKey)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "identity create failed", "detail": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "identity create failed"})
 		return
 	}
 
@@ -609,7 +637,7 @@ func (h *HiringHandler) createApplication(c *gin.Context, source string) {
 		VALUES ($1,$2,$3,$4,$5,$6::uuid,now())
 	`, applicationID, candidateID, req.JobID, storedSource, stage, nullableTemplateID(templateID))
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "application create failed", "detail": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "application create failed"})
 		return
 	}
 
@@ -883,10 +911,15 @@ func (h *HiringHandler) GetCandidate(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "candidate not found"})
 		return
 	}
-	decSSN, err := h.PII.Decrypt(ssn)
-	if err != nil {
-		decSSN = ""
+	decSSN := ""
+	if h.PII != nil {
+		if plain, err := h.PII.Decrypt(ssn); err == nil {
+			decSSN = plain
+		}
 	}
+	fullName = h.decryptCandidateValue(fullName)
+	email = h.decryptCandidateValue(email)
+	phone = h.decryptCandidateValue(phone)
 	c.JSON(http.StatusOK, gin.H{
 		"id":        id,
 		"full_name": fullName,
@@ -944,7 +977,7 @@ func (h *HiringHandler) CreateBlocklistRule(c *gin.Context) {
 		VALUES ($1,$2,$3,$4,true,now())
 	`, uuid.NewString(), strings.ToLower(req.RuleType), strings.ToLower(req.Pattern), sev)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to create blocklist rule", "detail": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to create blocklist rule"})
 		return
 	}
 	c.JSON(http.StatusCreated, gin.H{"created": true})
@@ -990,4 +1023,22 @@ func toIntVal(v any) int {
 func toBoolVal(v any) bool {
 	s := strings.ToLower(strings.TrimSpace(fmt.Sprint(v)))
 	return s == "true" || s == "1" || s == "yes"
+}
+
+func (h *HiringHandler) encryptCandidateValue(value string) (string, error) {
+	if h.PII == nil {
+		return value, nil
+	}
+	return h.PII.Encrypt(value)
+}
+
+func (h *HiringHandler) decryptCandidateValue(value string) string {
+	if strings.TrimSpace(value) == "" || h.PII == nil {
+		return value
+	}
+	plain, err := h.PII.Decrypt(value)
+	if err != nil {
+		return value
+	}
+	return plain
 }

@@ -54,16 +54,32 @@ func (h *AdminHandler) UpdateRolePermissions(c *gin.Context) {
 	}
 	defer tx.Rollback()
 
-	_, _ = tx.Exec(`DELETE FROM role_permissions WHERE role_id=$1::uuid`, roleID)
+	if _, err := tx.Exec(`DELETE FROM role_permissions WHERE role_id=$1::uuid`, roleID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to reset role permissions"})
+		return
+	}
 	for _, p := range req.Permissions {
 		var permID string
 		err := tx.QueryRow(`SELECT id::text FROM permissions WHERE module=$1 AND action=$2`, strings.ToLower(p.Module), strings.ToLower(p.Action)).Scan(&permID)
 		if err != nil {
+			if err != sql.ErrNoRows {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to resolve permission"})
+				return
+			}
 			permID = uuid.NewString()
-			_, _ = tx.Exec(`INSERT INTO permissions(id, module, action) VALUES ($1,$2,$3) ON CONFLICT (module, action) DO NOTHING`, permID, strings.ToLower(p.Module), strings.ToLower(p.Action))
-			_ = tx.QueryRow(`SELECT id::text FROM permissions WHERE module=$1 AND action=$2`, strings.ToLower(p.Module), strings.ToLower(p.Action)).Scan(&permID)
+			if _, err := tx.Exec(`INSERT INTO permissions(id, module, action) VALUES ($1,$2,$3) ON CONFLICT (module, action) DO NOTHING`, permID, strings.ToLower(p.Module), strings.ToLower(p.Action)); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create permission"})
+				return
+			}
+			if err := tx.QueryRow(`SELECT id::text FROM permissions WHERE module=$1 AND action=$2`, strings.ToLower(p.Module), strings.ToLower(p.Action)).Scan(&permID); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load permission"})
+				return
+			}
 		}
-		_, _ = tx.Exec(`INSERT INTO role_permissions(id, role_id, permission_id) VALUES ($1,$2::uuid,$3::uuid) ON CONFLICT DO NOTHING`, uuid.NewString(), roleID, permID)
+		if _, err := tx.Exec(`INSERT INTO role_permissions(id, role_id, permission_id) VALUES ($1,$2::uuid,$3::uuid) ON CONFLICT DO NOTHING`, uuid.NewString(), roleID, permID); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to assign permission"})
+			return
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -94,9 +110,15 @@ func (h *AdminHandler) UpdateRoleScopes(c *gin.Context) {
 	}
 	defer tx.Rollback()
 
-	_, _ = tx.Exec(`DELETE FROM scope_rules WHERE role_id=$1::uuid`, roleID)
+	if _, err := tx.Exec(`DELETE FROM scope_rules WHERE role_id=$1::uuid`, roleID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to reset role scopes"})
+		return
+	}
 	for _, s := range req.Scopes {
-		_, _ = tx.Exec(`INSERT INTO scope_rules(id, role_id, module, scope, scope_value) VALUES ($1,$2::uuid,$3,$4,$5)`, uuid.NewString(), roleID, strings.ToLower(s.Module), strings.ToLower(s.Scope), s.Value)
+		if _, err := tx.Exec(`INSERT INTO scope_rules(id, role_id, module, scope, scope_value) VALUES ($1,$2::uuid,$3,$4,$5)`, uuid.NewString(), roleID, strings.ToLower(s.Module), strings.ToLower(s.Scope), s.Value); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to assign scope"})
+			return
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -122,13 +144,16 @@ func (h *AdminHandler) RotateClientKey(c *gin.Context) {
 	newKeyID := req.KeyName + "-v" + seed
 	_, err := h.DB.Exec(`INSERT INTO client_keys(id, key_id, secret, created_at) VALUES ($1,$2,$3,now())`, uuid.NewString(), newKeyID, req.Secret)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to rotate key", "detail": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to rotate key"})
 		return
 	}
-	_, _ = h.DB.Exec(`
+	if _, err := h.DB.Exec(`
 		INSERT INTO key_rotation_events(key_name, to_version, actor_id, event_type)
 		VALUES ($1,1,$2::uuid,'ROTATE')
-	`, req.KeyName, c.GetString("userID"))
+	`, req.KeyName, c.GetString("userID")); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to record key rotation"})
+		return
+	}
 	c.JSON(http.StatusCreated, gin.H{"key_id": newKeyID})
 }
 

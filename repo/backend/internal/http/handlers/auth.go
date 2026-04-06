@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"database/sql"
+	"errors"
 	"net/http"
 	"time"
 
@@ -13,13 +14,14 @@ import (
 type AuthHandler struct {
 	DB         *sql.DB
 	Tokens     *security.TokenManager
+	Secrets    *security.PIIProtector
 	AccessTTL  time.Duration
 	RefreshTTL time.Duration
 	StepUpTTL  time.Duration
 }
 
-func NewAuthHandler(db *sql.DB, tokens *security.TokenManager, accessTTL, refreshTTL, stepUpTTL time.Duration) *AuthHandler {
-	return &AuthHandler{DB: db, Tokens: tokens, AccessTTL: accessTTL, RefreshTTL: refreshTTL, StepUpTTL: stepUpTTL}
+func NewAuthHandler(db *sql.DB, tokens *security.TokenManager, secrets *security.PIIProtector, accessTTL, refreshTTL, stepUpTTL time.Duration) *AuthHandler {
+	return &AuthHandler{DB: db, Tokens: tokens, Secrets: secrets, AccessTTL: accessTTL, RefreshTTL: refreshTTL, StepUpTTL: stepUpTTL}
 }
 
 type loginRequest struct {
@@ -79,11 +81,19 @@ func (h *AuthHandler) Login(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "refresh creation failed"})
 		return
 	}
+	encryptedRefresh, err := h.encryptSecret(refresh)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "refresh persistence failed"})
+		return
+	}
 	refreshTTLSeconds := int64(h.RefreshTTL.Seconds())
-	_, _ = h.DB.Exec(`
-		INSERT INTO refresh_tokens(id, user_id, token, expires_at)
-		VALUES ($1,$2,$3,now() + make_interval(secs => $4))
-	`, uuid.NewString(), userID, refresh, refreshTTLSeconds)
+	if _, err = h.DB.Exec(`
+		INSERT INTO refresh_tokens(id, user_id, token, token_hash, expires_at)
+		VALUES ($1,$2,$3,$4,now() + make_interval(secs => $5))
+	`, uuid.NewString(), userID, encryptedRefresh, security.HashOpaqueToken(refresh), refreshTTLSeconds); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "refresh persistence failed"})
+		return
+	}
 
 	c.JSON(http.StatusOK, gin.H{"access_token": access, "refresh_token": refresh})
 }
@@ -100,12 +110,13 @@ func (h *AuthHandler) Refresh(c *gin.Context) {
 	}
 
 	var userID, username string
+	refreshHash := security.HashOpaqueToken(req.RefreshToken)
 	err := h.DB.QueryRow(`
 		SELECT u.id, u.username
 		FROM refresh_tokens rt
 		JOIN users u ON u.id = rt.user_id
-		WHERE rt.token=$1 AND rt.revoked_at IS NULL AND rt.expires_at > now()
-	`, req.RefreshToken).Scan(&userID, &username)
+		WHERE rt.token_hash=$1 AND rt.revoked_at IS NULL AND rt.expires_at > now()
+	`, refreshHash).Scan(&userID, &username)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid refresh token"})
 		return
@@ -148,12 +159,20 @@ func (h *AuthHandler) StepUp(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to issue step-up token"})
 		return
 	}
+	encryptedToken, err := h.encryptSecret(token)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to persist step-up token"})
+		return
+	}
 
 	stepTTLSeconds := int64(h.StepUpTTL.Seconds())
-	_, _ = h.DB.Exec(`
-		INSERT INTO step_up_tokens(id, user_id, action_class, token, expires_at)
-		VALUES ($1,$2,$3,$4,now() + make_interval(secs => $5))
-	`, uuid.NewString(), userID, req.ActionClass, token, stepTTLSeconds)
+	if _, err = h.DB.Exec(`
+		INSERT INTO step_up_tokens(id, user_id, action_class, token, token_hash, expires_at)
+		VALUES ($1,$2,$3,$4,$5,now() + make_interval(secs => $6))
+	`, uuid.NewString(), userID, req.ActionClass, encryptedToken, security.HashOpaqueToken(token), stepTTLSeconds); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to persist step-up token"})
+		return
+	}
 
 	c.JSON(http.StatusOK, gin.H{"step_up_token": token})
 }
@@ -244,4 +263,11 @@ func (h *AuthHandler) Me(c *gin.Context) {
 		"permissions": permissions,
 		"scopes":      scopes,
 	})
+}
+
+func (h *AuthHandler) encryptSecret(secret string) (string, error) {
+	if h.Secrets == nil {
+		return "", errors.New("secret protector is not configured")
+	}
+	return h.Secrets.Encrypt(secret)
 }

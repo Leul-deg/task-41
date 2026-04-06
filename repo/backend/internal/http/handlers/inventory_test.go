@@ -175,3 +175,52 @@ func TestListOrders_GlobalScopeReturnsOrders(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestReverseLedger_CreatesCompensatingEntry(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db, mock, _ := sqlmock.New()
+	defer db.Close()
+
+	h := NewInventoryHandler(db)
+
+	mock.ExpectQuery(`SELECT COALESCE\(site_code`).WithArgs("user-1").WillReturnRows(
+		sqlmock.NewRows([]string{"site_code", "warehouse_code"}).AddRow("SITE-A", "WH-1"),
+	)
+	mock.ExpectQuery(`SELECT scope, COALESCE\(scope_value,''\)`).WithArgs("user-1").WillReturnRows(
+		sqlmock.NewRows([]string{"scope", "scope_value"}).AddRow("global", ""),
+	)
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT movement_type, sku, quantity, warehouse_code FROM inventory_ledger`).WithArgs("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").WillReturnRows(
+		sqlmock.NewRows([]string{"movement_type", "sku", "quantity", "warehouse_code"}).AddRow("OUTBOUND", "SKU-100", -2, "WH-1"),
+	)
+	mock.ExpectQuery(`SELECT EXISTS\(SELECT 1 FROM ledger_reversals`).WithArgs("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").WillReturnRows(
+		sqlmock.NewRows([]string{"exists"}).AddRow(false),
+	)
+	mock.ExpectExec(`UPDATE inventory_balances`).WithArgs("WH-1", "SKU-100", 2).WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(`INSERT INTO inventory_ledger`).WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(`INSERT INTO ledger_reversals`).WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectCommit()
+
+	r := gin.New()
+	r.Use(func(c *gin.Context) {
+		c.Set("userID", "user-1")
+		c.Next()
+	})
+	r.POST("/ledger/:id/reverse", h.ReverseLedger)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/ledger/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/reverse", bytes.NewBufferString(`{"reason_code":"CORRECTION"}`))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201 got %d body=%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"reversed":true`) {
+		t.Fatalf("expected reversed response, got: %s", w.Body.String())
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}

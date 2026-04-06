@@ -176,12 +176,11 @@ func proxyAuthJSON(w http.ResponseWriter, r *http.Request, cfg appConfig, target
 		}
 	}
 
-	req, err := http.NewRequestWithContext(r.Context(), r.Method, target, bytes.NewReader(body))
+	req, err := signedBackendRequest(r.Context(), r.Method, target, body, cfg)
 	if err != nil {
 		http.Error(w, "proxy request creation failed", http.StatusInternalServerError)
 		return
 	}
-	req.Header.Set("Content-Type", "application/json")
 	copyAuthHeaders(r, req)
 	if req.Header.Get("Authorization") == "" {
 		if token, ok := getCookieValue(r, accessCookieName); ok {
@@ -307,11 +306,10 @@ func validateAccessToken(ctx context.Context, cfg appConfig, accessToken string)
 func refreshTokens(ctx context.Context, cfg appConfig, refreshToken string) (string, string, bool) {
 	payload := map[string]string{"refresh_token": refreshToken}
 	body, _ := json.Marshal(payload)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.BackendURL+"/auth/refresh", bytes.NewReader(body))
+	req, err := signedBackendRequest(ctx, http.MethodPost, cfg.BackendURL+"/auth/refresh", body, cfg)
 	if err != nil {
 		return "", "", false
 	}
-	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {

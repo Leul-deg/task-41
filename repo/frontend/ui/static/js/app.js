@@ -633,13 +633,38 @@
       if (!hasManual && !hasCSV) return;
       const result = await fetchJobsForDropdown(false);
       if (result.state === "ok") {
-        if (hasManual) populateJobDropdown("manual-job-id", result.jobs || []);
-        if (hasCSV) populateJobDropdown("csv-job-id", result.jobs || []);
+        const jobs = result.jobs || [];
+        const placeholder = jobs.length ? "Select a job" : "No jobs available";
+        if (hasManual) populateJobDropdown("manual-job-id", jobs, placeholder);
+        if (hasCSV) populateJobDropdown("csv-job-id", jobs, placeholder);
+        setJobDropdownMessage(
+          "manual-job-state",
+          jobs.length ? `${jobs.length} job(s) available` : "No jobs available",
+          jobs.length ? "info" : "error",
+        );
+        setJobActionEnabled(jobs.length > 0);
+        setVisibility(byId("manual-job-retry"), false);
         return;
       }
-      if (hasManual)
-        populateJobDropdown("manual-job-id", [], "Unable to load jobs");
-      if (hasCSV) populateJobDropdown("csv-job-id", [], "Unable to load jobs");
+      let placeholder = "Unable to load jobs";
+      let stateMessage = result.error || "Unable to load jobs";
+      let allowRetry = false;
+      if (result.state === "unauthorized") {
+        placeholder = "Session expired while loading jobs";
+        stateMessage = "Session expired while loading jobs";
+      } else if (result.state === "forbidden") {
+        placeholder = "Access denied to job list";
+        stateMessage = "Access denied to job list";
+      } else {
+        placeholder = "Failed to load jobs (Retry)";
+        stateMessage = "Failed to load jobs";
+        allowRetry = true;
+      }
+      if (hasManual) populateJobDropdown("manual-job-id", [], placeholder);
+      if (hasCSV) populateJobDropdown("csv-job-id", [], placeholder);
+      setJobDropdownMessage("manual-job-state", stateMessage, "error");
+      setJobActionEnabled(false);
+      setVisibility(byId("manual-job-retry"), allowRetry);
       logTo(
         "hiring-jobs-log",
         `Job dropdown load failed: ${result.error || result.state}`,
@@ -730,6 +755,8 @@
         byId("hiring-jobs-log").textContent = err.error || "Load jobs failed";
       }
     };
+    const retryJobs = byId("manual-job-retry");
+    if (retryJobs) retryJobs.onclick = refreshJobDropdowns;
 
     async function submitIntake(endpoint) {
       const payload = {
@@ -1129,12 +1156,21 @@
       const checksum = Array.from(new Uint8Array(hash))
         .map((b) => b.toString(16).padStart(2, "0"))
         .join("");
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      let binary = "";
+      const chunkSize = 0x8000;
+      for (let i = 0; i < bytes.length; i += chunkSize) {
+        binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+      }
+      const contentBase64 = btoa(binary);
       try {
         await apiPost(`/rpc/api/support/tickets/${ticketID}/attachments`, {
           file_name: file.name,
           mime_type: file.type,
           size_mb: Math.max(1, Math.ceil(file.size / (1024 * 1024))),
+          size_bytes: file.size,
           checksum,
+          content_base64: contentBase64,
         });
         logTo("support-attach-log", `Attachment accepted ${file.name}`);
       } catch (err) {

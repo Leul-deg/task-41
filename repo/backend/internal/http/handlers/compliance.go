@@ -26,7 +26,7 @@ func NewComplianceHandler(db *sql.DB) *ComplianceHandler {
 func (h *ComplianceHandler) RunCrawler(c *gin.Context) {
 	indexed, queued, err := h.Svc.RunCrawler()
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "crawler run failed"})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"indexed": indexed, "queued": queued})
@@ -62,10 +62,28 @@ func (h *ComplianceHandler) CreateDeletionRequest(c *gin.Context) {
 
 func (h *ComplianceHandler) ProcessDeletionRequest(c *gin.Context) {
 	id := c.Param("id")
+	tx, err := h.DB.Begin()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to start deletion transaction"})
+		return
+	}
+	defer tx.Rollback()
+
 	var policy string
-	err := h.DB.QueryRow(`SELECT COALESCE(policy_result,'') FROM deletion_requests WHERE id=$1::uuid`, id).Scan(&policy)
+	var subjectRef string
+	var status string
+	err = tx.QueryRow(`
+		SELECT COALESCE(policy_result,''), subject_ref, status
+		FROM deletion_requests
+		WHERE id=$1::uuid
+		FOR UPDATE
+	`, id).Scan(&policy, &subjectRef, &status)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "deletion request not found"})
+		return
+	}
+	if strings.EqualFold(status, "COMPLETED") {
+		c.JSON(http.StatusConflict, gin.H{"error": "deletion request already completed"})
 		return
 	}
 
@@ -73,13 +91,33 @@ func (h *ComplianceHandler) ProcessDeletionRequest(c *gin.Context) {
 		policy = "anonymize"
 	}
 
+	var result sql.Result
 	if policy == "hard_delete" {
-		_, _ = h.DB.Exec(`DELETE FROM candidates WHERE id IN (SELECT subject_ref::uuid FROM deletion_requests WHERE id=$1::uuid)`, id)
+		result, err = tx.Exec(`DELETE FROM candidates WHERE id=$1::uuid`, subjectRef)
 	} else {
-		_, _ = h.DB.Exec(`UPDATE candidates SET full_name='ANONYMIZED', email=NULL, phone=NULL, ssn_raw=NULL WHERE id IN (SELECT subject_ref::uuid FROM deletion_requests WHERE id=$1::uuid)`, id)
+		result, err = tx.Exec(`UPDATE candidates SET full_name='ANONYMIZED', email=NULL, phone=NULL, ssn_raw=NULL WHERE id=$1::uuid`, subjectRef)
 	}
-
-	_, _ = h.DB.Exec(`UPDATE deletion_requests SET status='COMPLETED' WHERE id=$1::uuid`, id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "deletion mutation failed"})
+		return
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to verify deletion mutation"})
+		return
+	}
+	if affected == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "deletion subject not found"})
+		return
+	}
+	if _, err = tx.Exec(`UPDATE deletion_requests SET status='COMPLETED' WHERE id=$1::uuid`, id); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to finalize deletion request"})
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to commit deletion request"})
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"processed": true, "policy": policy})
 }
 

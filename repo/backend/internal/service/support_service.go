@@ -98,7 +98,7 @@ func (s *SupportService) ComputeSLADue(siteCode, priority string, from time.Time
 		loc = time.UTC
 	}
 
-	needHours := 8.0
+	needHours := businessHoursForPriority(priority, start, end)
 	if strings.EqualFold(priority, "HIGH") {
 		needHours = 4.0
 	}
@@ -155,4 +155,31 @@ func parseHolidays(csv string) map[string]bool {
 		}
 	}
 	return out
+}
+
+func businessHoursForPriority(priority, start, end string) float64 {
+	if strings.EqualFold(priority, "HIGH") {
+		return 4.0
+	}
+	startMinutes, okStart := parseClockMinutes(start)
+	endMinutes, okEnd := parseClockMinutes(end)
+	if !okStart || !okEnd || endMinutes <= startMinutes {
+		return 8.0
+	}
+	return float64(endMinutes-startMinutes) / 60.0
+}
+
+func parseClockMinutes(value string) (int, bool) {
+	if len(value) < 5 {
+		return 0, false
+	}
+	hours, err := strconv.Atoi(value[:2])
+	if err != nil {
+		return 0, false
+	}
+	minutes, err := strconv.Atoi(value[3:5])
+	if err != nil {
+		return 0, false
+	}
+	return hours*60 + minutes, true
 }

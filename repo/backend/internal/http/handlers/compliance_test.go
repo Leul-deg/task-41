@@ -69,11 +69,13 @@ func TestProcessDeletionRequest_RequiresStepUpToken(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	mock.ExpectQuery(`SELECT COALESCE\(policy_result,''\) FROM deletion_requests`).WithArgs("11111111-1111-1111-1111-111111111111").WillReturnRows(
-		sqlmock.NewRows([]string{"policy"}).AddRow("anonymize"),
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT COALESCE\(policy_result,''\), subject_ref, status`).WithArgs("11111111-1111-1111-1111-111111111111").WillReturnRows(
+		sqlmock.NewRows([]string{"policy", "subject_ref", "status"}).AddRow("anonymize", "11111111-1111-1111-1111-111111111111", "PENDING"),
 	)
 	mock.ExpectExec("UPDATE candidates SET full_name='ANONYMIZED'").WithArgs("11111111-1111-1111-1111-111111111111").WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectExec("UPDATE deletion_requests SET status='COMPLETED'").WithArgs("11111111-1111-1111-1111-111111111111").WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectCommit()
 
 	w2 := httptest.NewRecorder()
 	req2 := httptest.NewRequest(http.MethodPost, "/deletion/11111111-1111-1111-1111-111111111111/process", nil)

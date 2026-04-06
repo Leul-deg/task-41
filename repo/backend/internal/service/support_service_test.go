@@ -32,3 +32,26 @@ func TestComputeSLADue_UsesConfiguredWeekendAndHolidays(t *testing.T) {
 		t.Fatalf("due should skip holiday 2026-03-30, got %s", local)
 	}
 }
+
+func TestComputeSLADue_StandardUsesConfiguredBusinessDayLength(t *testing.T) {
+	db, mock, _ := sqlmock.New()
+	defer db.Close()
+
+	mock.ExpectQuery("SELECT timezone, business_start::text, business_end::text,").
+		WithArgs("SITE-A").
+		WillReturnRows(sqlmock.NewRows([]string{"timezone", "business_start", "business_end", "weekend_days", "holidays"}).
+			AddRow("America/New_York", "08:00:00", "18:00:00", "0,6", ""))
+
+	svc := NewSupportService(db)
+	start := time.Date(2026, 4, 1, 15, 0, 0, 0, time.UTC)
+	due, err := svc.ComputeSLADue("SITE-A", "STANDARD", start)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	loc, _ := time.LoadLocation("America/New_York")
+	local := due.In(loc)
+	if local.Hour() != 11 || local.Minute() != 0 {
+		t.Fatalf("expected standard SLA to land after one full 10-hour business day, got %s", local)
+	}
+}

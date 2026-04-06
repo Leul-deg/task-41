@@ -329,7 +329,7 @@ func (h *InventoryHandler) CreateReservation(c *gin.Context) {
 		VALUES ($1,$2,$3,$4,$5,0,'HELD',now()+interval '2 hours',now())
 	`, id, req.OrderID, req.SKU, alloc.WarehouseCode, alloc.AllocatedQty)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "reservation create failed", "detail": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "reservation create failed"})
 		return
 	}
 
@@ -717,8 +717,16 @@ func (h *InventoryHandler) ReverseLedger(c *gin.Context) {
 		return
 	}
 
-	var wh string
-	if err := h.DB.QueryRow(`SELECT warehouse_code FROM inventory_ledger WHERE id=$1::uuid`, ledgerID).Scan(&wh); err != nil {
+	tx, err := h.DB.BeginTx(context.Background(), nil)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "transaction failed"})
+		return
+	}
+	defer tx.Rollback()
+
+	var movementType, sku, wh string
+	var qty int
+	if err := tx.QueryRow(`SELECT movement_type, sku, quantity, warehouse_code FROM inventory_ledger WHERE id=$1::uuid`, ledgerID).Scan(&movementType, &sku, &qty, &wh); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "ledger entry not found"})
 		return
 	}
@@ -732,15 +740,54 @@ func (h *InventoryHandler) ReverseLedger(c *gin.Context) {
 	}
 
 	actor := c.GetString("userID")
-	_, err = h.DB.Exec(`
+	var alreadyReversed bool
+	if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM ledger_reversals WHERE ledger_id=$1::uuid)`, ledgerID).Scan(&alreadyReversed); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to verify reversal state"})
+		return
+	}
+	if alreadyReversed {
+		c.JSON(http.StatusConflict, gin.H{"error": "ledger entry already reversed"})
+		return
+	}
+
+	compensatingQty := -qty
+	result, err := tx.Exec(`
+		UPDATE inventory_balances
+		SET on_hand=on_hand+$3, updated_at=now()
+		WHERE warehouse_code=$1 AND sku=$2
+	`, wh, sku, compensatingQty)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to apply reversal stock adjustment"})
+		return
+	}
+	rows, err := result.RowsAffected()
+	if err != nil || rows == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "inventory row not found for reversal"})
+		return
+	}
+
+	reversalLedgerID := uuid.NewString()
+	if _, err = tx.Exec(`
+		INSERT INTO inventory_ledger(id, movement_type, sku, quantity, warehouse_code, reason_code, created_by, reversal_of)
+		VALUES ($1,'REVERSAL',$2,$3,$4,$5,$6::uuid,$7::uuid)
+	`, reversalLedgerID, sku, compensatingQty, wh, req.ReasonCode, actor, ledgerID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create compensating ledger entry"})
+		return
+	}
+
+	_, err = tx.Exec(`
 		INSERT INTO ledger_reversals(id, ledger_id, approver_id, reason_code, created_at)
 		VALUES ($1,$2,$3,$4,now())
 	`, uuid.NewString(), ledgerID, actor, req.ReasonCode)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "reversal failed", "detail": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "reversal failed"})
 		return
 	}
-	c.JSON(http.StatusCreated, gin.H{"reversed": true})
+	if err := tx.Commit(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "commit failed"})
+		return
+	}
+	c.JSON(http.StatusCreated, gin.H{"reversed": true, "reversal_ledger_id": reversalLedgerID, "original_movement_type": movementType})
 }
 
 func ternary(cond bool, a, b string) string {

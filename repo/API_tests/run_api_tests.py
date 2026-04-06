@@ -19,10 +19,7 @@ class APITestRunner:
         self.failures = []
         self.tokens = {}
         self.ctx = {}
-        self.gaps = [
-            "TODO: admin role/scope management endpoints are not fully covered in API suite",
-            "TODO: inventory transfer/cycle-count/reversal endpoints are not fully covered in API suite",
-        ]
+        self.gaps = []
 
     def _request(self, method, path, body=None, token=None, step_up=None, idem_key=None):
         data = None
@@ -158,6 +155,54 @@ class APITestRunner:
         ok = status == 200 and isinstance(body, dict) and any(a.get("application_id") == self.ctx.get("application_id") for a in body.get("applications", []))
         self._record("hiring.list_applications_post_create_state", ok, "created application not found in application list" if not ok else "", self._snippet(body) if not ok else "")
 
+    def test_admin(self):
+        token = self.tokens["admin"]
+
+        status, body = self._request("GET", "/rpc/api/admin/roles", token=token)
+        roles_ok = status == 200 and isinstance(body, dict) and len(self._dict_list(body, "roles")) > 0
+        self._record("admin.list_roles", roles_ok, "roles list unavailable" if not roles_ok else "", self._snippet(body) if not roles_ok else "")
+        if not roles_ok:
+            return
+
+        recruiter_role_id = ""
+        for role in self._dict_list(body, "roles"):
+            if role.get("code") == "HR_RECRUITER":
+                recruiter_role_id = role.get("id", "")
+                break
+        if not recruiter_role_id:
+            self._record("admin.resolve_recruiter_role", False, "HR_RECRUITER role missing", self._snippet(body))
+            return
+
+        status, body = self._request("POST", "/rpc/api/auth/step-up", {"password": "LocalAdminPass123!", "action_class": "role_permission_change"}, token=token)
+        step_ok = self._expect_status("admin.obtain_stepup", status, 200, body)
+        step_token = body.get("step_up_token") if step_ok and isinstance(body, dict) else ""
+        if not step_token:
+            return
+
+        status, body = self._request(
+            "PUT",
+            f"/rpc/api/admin/roles/{recruiter_role_id}/permissions",
+            {"permissions": [{"module": "hiring", "action": "view"}, {"module": "hiring", "action": "create"}]},
+            token=token,
+            step_up=step_token,
+        )
+        self._expect_status("admin.update_role_permissions", status, 200, body)
+
+        status, body = self._request("POST", "/rpc/api/auth/step-up", {"password": "LocalAdminPass123!", "action_class": "role_permission_change"}, token=token)
+        step_ok = self._expect_status("admin.obtain_stepup_for_scopes", status, 200, body)
+        step_token = body.get("step_up_token") if step_ok and isinstance(body, dict) else ""
+        if not step_token:
+            return
+
+        status, body = self._request(
+            "PUT",
+            f"/rpc/api/admin/roles/{recruiter_role_id}/scopes",
+            {"scopes": [{"module": "hiring", "scope": "site", "value": "SITE-A"}]},
+            token=token,
+            step_up=step_token,
+        )
+        self._expect_status("admin.update_role_scopes", status, 200, body)
+
     def test_kiosk(self):
         status, body = self._request("POST", "/rpc/api/hiring/applications/kiosk", {"job_id": self.ctx.get("job_id")})
         self._expect_status("kiosk.authenticated_endpoint_requires_auth", status, 401, body)
@@ -246,6 +291,28 @@ class APITestRunner:
         released = any(r.get("order_id") == order_id and r.get("status") == "RELEASED" for r in self._dict_list(body, "reservations")) if post_cancel_ok else False
         self._record("inventory.post_cancel_state_released", post_cancel_ok and released, "reservation not in RELEASED state after cancellation" if not (post_cancel_ok and released) else "", self._snippet(body) if not (post_cancel_ok and released) else "")
 
+        status, body = self._request(
+            "POST",
+            "/rpc/api/inventory/transfers",
+            {"sku": "SKU-100", "quantity": 1, "from_warehouse": "WH-1", "to_warehouse": "WH-2", "reason_code": "API_TRANSFER"},
+            token=token,
+        )
+        self._expect_status("inventory.transfer_between_warehouses", status, 201, body)
+
+        status, body = self._request("GET", "/rpc/api/inventory/balances?site=SITE-A", token=token)
+        balances_ok = status == 200 and isinstance(body, dict) and len(self._dict_list(body, "balances")) > 0
+        self._record("inventory.load_balances_for_cycle_count", balances_ok, "balances unavailable for cycle-count coverage" if not balances_ok else "", self._snippet(body) if not balances_ok else "")
+        if balances_ok:
+            first = self._dict_list(body, "balances")[0]
+            counted_qty = int(first.get("on_hand", 0))
+            status, body = self._request(
+                "POST",
+                "/rpc/api/inventory/cycle-counts",
+                {"warehouse_code": first.get("warehouse"), "sku": first.get("sku"), "counted_qty": counted_qty, "reason_code": "API_CYCLE"},
+                token=token,
+            )
+            self._expect_status("inventory.cycle_count_happy_path", status, 201, body)
+
     def test_compliance(self):
         token = self.tokens["admin"]
 
@@ -289,6 +356,7 @@ class APITestRunner:
         ordered_tests = [
             ("preflight", self.test_preflight),
             ("auth", self.test_auth),
+            ("admin", self.test_admin),
             ("hiring", self.test_hiring),
             ("kiosk", self.test_kiosk),
             ("support", self.test_support),

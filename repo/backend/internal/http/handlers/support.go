@@ -1,24 +1,33 @@
 package handlers
 
 import (
+	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"meridian/backend/internal/platform/security"
 	"meridian/backend/internal/service"
 )
 
 type SupportHandler struct {
-	DB  *sql.DB
-	Svc *service.SupportService
+	DB      *sql.DB
+	Svc     *service.SupportService
+	Secrets *security.PIIProtector
 }
 
-func NewSupportHandler(db *sql.DB) *SupportHandler {
-	return &SupportHandler{DB: db, Svc: service.NewSupportService(db)}
+const maxAttachmentBytes = 10 * 1024 * 1024
+
+func NewSupportHandler(db *sql.DB, secrets *security.PIIProtector) *SupportHandler {
+	return &SupportHandler{DB: db, Svc: service.NewSupportService(db), Secrets: secrets}
 }
 
 type supportAccess struct {
@@ -77,6 +86,18 @@ func (h *SupportHandler) loadAccess(c *gin.Context) (supportAccess, error) {
 	return access, nil
 }
 
+func (h *SupportHandler) hasAssignment(userID, entityType, entityID string) bool {
+	var ok bool
+	_ = h.DB.QueryRow(`
+		SELECT EXISTS(
+			SELECT 1
+			FROM user_assignments
+			WHERE user_id=$1::uuid AND entity_type=$2 AND entity_id=$3
+		)
+	`, userID, entityType, entityID).Scan(&ok)
+	return ok
+}
+
 func (h *SupportHandler) ticketAllowed(access supportAccess, ticketID string) (bool, error) {
 	if access.Global {
 		return true, nil
@@ -84,13 +105,17 @@ func (h *SupportHandler) ticketAllowed(access supportAccess, ticketID string) (b
 
 	var siteCode string
 	var assignee sql.NullString
-	err := h.DB.QueryRow(`SELECT COALESCE(calendar_site_code,'SITE-A'), assignee_id::text FROM support_tickets WHERE id=$1`, ticketID).Scan(&siteCode, &assignee)
+	var orderID string
+	err := h.DB.QueryRow(`SELECT COALESCE(calendar_site_code,'SITE-A'), assignee_id::text, order_id FROM support_tickets WHERE id=$1`, ticketID).Scan(&siteCode, &assignee, &orderID)
 	if err != nil {
 		return false, err
 	}
 
 	if access.AssignedOnly {
-		return assignee.Valid && strings.EqualFold(assignee.String, access.UserID), nil
+		if assignee.Valid && strings.EqualFold(assignee.String, access.UserID) {
+			return true, nil
+		}
+		return h.hasAssignment(access.UserID, "ticket", ticketID) || h.hasAssignment(access.UserID, "order", orderID), nil
 	}
 	return strings.EqualFold(siteCode, access.SiteCode), nil
 }
@@ -110,7 +135,7 @@ func (h *SupportHandler) ListTickets(c *gin.Context) {
 	args := []any{}
 	if !access.Global {
 		if access.AssignedOnly {
-			query += ` WHERE assignee_id=$1::uuid `
+			query += ` WHERE assignee_id=$1::uuid OR id::text IN (SELECT entity_id FROM user_assignments WHERE user_id=$1::uuid AND entity_type='ticket') `
 			args = append(args, access.UserID)
 		} else {
 			query += ` WHERE COALESCE(calendar_site_code,'SITE-A')=$1 `
@@ -165,8 +190,13 @@ func (h *SupportHandler) ListOrders(c *gin.Context) {
 	`
 	args := []any{}
 	if !access.Global {
-		query += ` WHERE site_code=$1 `
-		args = append(args, access.SiteCode)
+		if access.AssignedOnly {
+			query += ` WHERE id IN (SELECT entity_id FROM user_assignments WHERE user_id=$1::uuid AND entity_type='order') `
+			args = append(args, access.UserID)
+		} else {
+			query += ` WHERE site_code=$1 `
+			args = append(args, access.SiteCode)
+		}
 	}
 	query += ` ORDER BY created_at DESC LIMIT 300 `
 
@@ -293,7 +323,7 @@ func (h *SupportHandler) CreateTicket(c *gin.Context) {
 
 	elig, err := h.Svc.EvaluateEligibility(req.OrderID, tt)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "order is not eligible for the requested support flow"})
 		return
 	}
 	if elig.RefundOnly && tt == "return_and_refund" {
@@ -314,12 +344,25 @@ func (h *SupportHandler) CreateTicket(c *gin.Context) {
 	defer tx.Rollback()
 
 	id := uuid.NewString()
+	var assigneeID any
+	if access.AssignedOnly {
+		assigneeID = access.UserID
+	}
 	_, err = tx.Exec(`
-		INSERT INTO support_tickets(id, order_id, ticket_type, priority, description, status, record_version, created_at, sla_due_at, calendar_site_code)
-		VALUES ($1,$2,$3,$4,$5,'OPEN',1,now(),$6,$7)
-	`, id, req.OrderID, tt, strings.ToUpper(req.Priority), req.Description, slaDue, req.BusinessSite)
+		INSERT INTO support_tickets(id, order_id, ticket_type, priority, description, status, assignee_id, record_version, created_at, sla_due_at, calendar_site_code)
+		VALUES ($1,$2,$3,$4,$5,'OPEN',$6::uuid,1,now(),$7,$8)
+	`, id, req.OrderID, tt, strings.ToUpper(req.Priority), req.Description, assigneeID, slaDue, req.BusinessSite)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "ticket creation failed", "detail": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "ticket creation failed"})
+		return
+	}
+
+	if _, err = tx.Exec(`
+		INSERT INTO user_assignments(user_id, entity_type, entity_id)
+		VALUES ($1::uuid,'ticket',$2), ($1::uuid,'order',$3)
+		ON CONFLICT (user_id, entity_type, entity_id) DO NOTHING
+	`, access.UserID, id, req.OrderID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to assign support entities"})
 		return
 	}
 
@@ -365,10 +408,12 @@ func (h *SupportHandler) AddAttachment(c *gin.Context) {
 
 	ticketID := c.Param("id")
 	var req struct {
-		FileName string `json:"file_name"`
-		MimeType string `json:"mime_type"`
-		SizeMB   int    `json:"size_mb"`
-		Checksum string `json:"checksum"`
+		FileName    string `json:"file_name"`
+		MimeType    string `json:"mime_type"`
+		SizeMB      int    `json:"size_mb"`
+		SizeBytes   int64  `json:"size_bytes"`
+		Checksum    string `json:"checksum"`
+		ContentBase string `json:"content_base64"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid payload"})
@@ -381,6 +426,27 @@ func (h *SupportHandler) AddAttachment(c *gin.Context) {
 	allowedTypes := map[string]bool{"image/jpeg": true, "image/png": true, "application/pdf": true}
 	if !allowedTypes[strings.ToLower(req.MimeType)] {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "unsupported attachment type"})
+		return
+	}
+	raw, err := base64.StdEncoding.DecodeString(req.ContentBase)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "attachment content is not valid base64"})
+		return
+	}
+	if len(raw) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "attachment content is required"})
+		return
+	}
+	if int64(len(raw)) > maxAttachmentBytes {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "attachment exceeds 10MB limit"})
+		return
+	}
+	if req.SizeBytes > 0 && req.SizeBytes != int64(len(raw)) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "attachment size mismatch"})
+		return
+	}
+	if hash := sha256.Sum256(raw); !strings.EqualFold(req.Checksum, hex.EncodeToString(hash[:])) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "attachment checksum mismatch"})
 		return
 	}
 
@@ -408,16 +474,27 @@ func (h *SupportHandler) AddAttachment(c *gin.Context) {
 		return
 	}
 
-	_, err = h.DB.Exec(`
-		INSERT INTO ticket_attachments(id, ticket_id, file_name, mime_type, size_mb, checksum, created_at)
-		VALUES ($1,$2,$3,$4,$5,$6,now())
-	`, uuid.NewString(), ticketID, req.FileName, strings.ToLower(req.MimeType), req.SizeMB, req.Checksum)
+	attachmentID := uuid.NewString()
+	storagePath, err := h.persistSupportAttachment(ticketID, attachmentID, req.FileName, req.MimeType, raw)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "attachment save failed", "detail": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "attachment storage failed"})
+		return
+	}
+	sizeMB := req.SizeMB
+	if sizeMB <= 0 {
+		sizeMB = maxInt(1, int((len(raw)+(1024*1024)-1)/(1024*1024)))
+	}
+	_, err = h.DB.Exec(`
+		INSERT INTO ticket_attachments(id, ticket_id, file_name, mime_type, size_mb, size_bytes, checksum, storage_path, created_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,now())
+	`, attachmentID, ticketID, req.FileName, strings.ToLower(req.MimeType), sizeMB, len(raw), req.Checksum, storagePath)
+	if err != nil {
+		_ = os.Remove(storagePath)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "attachment save failed"})
 		return
 	}
 
-	c.JSON(http.StatusCreated, gin.H{"ok": true})
+	c.JSON(http.StatusCreated, gin.H{"ok": true, "attachment_id": attachmentID})
 }
 
 func (h *SupportHandler) GetTicket(c *gin.Context) {
@@ -507,22 +584,28 @@ func (h *SupportHandler) ResolveConflict(c *gin.Context) {
 			return
 		}
 		if mode == "merge" {
-			_, _ = h.DB.Exec(`
+			if _, err := h.DB.Exec(`
 				UPDATE support_tickets
 				SET description=description || E'\n' || $2, conflict_note='merged client change', record_version=record_version+1, updated_at=now()
 				WHERE id=$1
-			`, id, req.Description)
+			`, id, req.Description); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "conflict merge failed"})
+				return
+			}
 			c.JSON(http.StatusOK, gin.H{"merged": true})
 			return
 		}
 	}
 
 	if mode == "overwrite" {
-		_, _ = h.DB.Exec(`
+		if _, err := h.DB.Exec(`
 			UPDATE support_tickets
 			SET description=$2, conflict_note='overwritten by client', record_version=record_version+1, updated_at=now()
 			WHERE id=$1
-		`, id, req.Description)
+		`, id, req.Description); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "conflict overwrite failed"})
+			return
+		}
 		c.JSON(http.StatusOK, gin.H{"overwritten": true})
 		return
 	}
@@ -561,7 +644,7 @@ func (h *SupportHandler) ApproveRefund(c *gin.Context) {
 		WHERE id=$1
 	`, req.TicketID)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "refund approval failed", "detail": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "refund approval failed"})
 		return
 	}
 
@@ -571,4 +654,50 @@ func (h *SupportHandler) ApproveRefund(c *gin.Context) {
 	`, c.GetString("userID"), req.TicketID, `{"note":"`+strings.ReplaceAll(req.Note, "\"", "")+`"}`)
 
 	c.JSON(http.StatusOK, gin.H{"approved": true})
+}
+
+func (h *SupportHandler) persistSupportAttachment(ticketID, attachmentID, fileName, mimeType string, raw []byte) (string, error) {
+	root := strings.TrimSpace(os.Getenv("ATTACHMENT_STORAGE_DIR"))
+	if root == "" {
+		root = filepath.Join(".", "data", "support_attachments")
+	}
+	dir := filepath.Join(root, ticketID)
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		return "", err
+	}
+	ext := strings.ToLower(strings.TrimSpace(filepath.Ext(fileName)))
+	if ext == "" {
+		switch strings.ToLower(strings.TrimSpace(mimeType)) {
+		case "image/jpeg":
+			ext = ".jpg"
+		case "image/png":
+			ext = ".png"
+		case "application/pdf":
+			ext = ".pdf"
+		default:
+			ext = ".bin"
+		}
+	}
+	path := filepath.Join(dir, attachmentID+ext)
+	encrypted := raw
+	if h.Secrets != nil {
+		payload, err := h.Secrets.EncryptBytes(raw)
+		if err != nil {
+			return "", err
+		}
+		if len(payload) > 0 {
+			encrypted = payload
+		}
+	}
+	if err := os.WriteFile(path, encrypted, 0o640); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }

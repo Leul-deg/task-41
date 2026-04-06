@@ -4,10 +4,12 @@ import (
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -42,15 +44,22 @@ func (p *PIIProtector) Encrypt(plaintext string) (string, error) {
 	return fmt.Sprintf("k%d:%s", version, ciphertext), nil
 }
 
+func (p *PIIProtector) EncryptBytes(plaintext []byte) ([]byte, error) {
+	if len(plaintext) == 0 {
+		return nil, nil
+	}
+	encoded, err := p.Encrypt(base64.RawStdEncoding.EncodeToString(plaintext))
+	if err != nil {
+		return nil, err
+	}
+	return []byte(encoded), nil
+}
+
 func (p *PIIProtector) Decrypt(stored string) (string, error) {
 	if strings.TrimSpace(stored) == "" {
 		return "", nil
 	}
-	parts := strings.SplitN(stored, ":", 2)
-	if len(parts) != 2 || !strings.HasPrefix(parts[0], "k") {
-		return "", errors.New("invalid encrypted payload format")
-	}
-	v, err := strconv.Atoi(strings.TrimPrefix(parts[0], "k"))
+	v, payload, err := parseEncryptedEnvelope(stored)
 	if err != nil {
 		return "", err
 	}
@@ -58,7 +67,124 @@ func (p *PIIProtector) Decrypt(stored string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return open(keyMaterial, parts[1])
+	return open(keyMaterial, payload)
+}
+
+func (p *PIIProtector) DecryptBytes(stored []byte) ([]byte, error) {
+	if len(stored) == 0 {
+		return nil, nil
+	}
+	decoded, err := p.Decrypt(string(stored))
+	if err != nil {
+		return nil, err
+	}
+	return base64.RawStdEncoding.DecodeString(decoded)
+}
+
+func (p *PIIProtector) IsEncryptedValue(stored string) bool {
+	if strings.TrimSpace(stored) == "" {
+		return false
+	}
+	_, err := p.Decrypt(stored)
+	return err == nil
+}
+
+func (p *PIIProtector) DeterministicToken(plaintext string) (string, error) {
+	if strings.TrimSpace(plaintext) == "" {
+		return "", nil
+	}
+	version, keyMaterial, err := p.activeKey(context.Background())
+	if err != nil {
+		return "", err
+	}
+	return deterministicToken(version, keyMaterial, plaintext), nil
+}
+
+func (p *PIIProtector) DeterministicTokens(plaintext string) ([]string, error) {
+	if strings.TrimSpace(plaintext) == "" {
+		return nil, nil
+	}
+	if p.DB == nil {
+		if strings.TrimSpace(p.FallbackSeed) == "" {
+			return nil, errors.New("no active encryption key")
+		}
+		return []string{deterministicToken(1, p.FallbackSeed, plaintext)}, nil
+	}
+
+	rows, err := p.DB.QueryContext(context.Background(), `
+		SELECT key_version, key_value
+		FROM encryption_keys
+		WHERE key_name=$1
+		ORDER BY key_version DESC
+	`, p.KeyName)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []string{}
+	for rows.Next() {
+		var version int
+		var keyValue string
+		if rows.Scan(&version, &keyValue) == nil {
+			out = append(out, deterministicToken(version, keyValue, plaintext))
+		}
+	}
+	if len(out) == 0 && strings.TrimSpace(p.FallbackSeed) != "" {
+		out = append(out, deterministicToken(1, p.FallbackSeed, plaintext))
+	}
+	if len(out) == 0 {
+		return nil, errors.New("no key versions available")
+	}
+	return out, nil
+}
+
+func (p *PIIProtector) LegacyDeterministicTokens(plaintext string) ([]string, error) {
+	if strings.TrimSpace(plaintext) == "" {
+		return nil, nil
+	}
+	if p.DB == nil {
+		if strings.TrimSpace(p.FallbackSeed) == "" {
+			return nil, errors.New("no active encryption key")
+		}
+		return []string{legacyDeterministicToken(p.FallbackSeed, plaintext)}, nil
+	}
+
+	rows, err := p.DB.QueryContext(context.Background(), `
+		SELECT key_value
+		FROM encryption_keys
+		WHERE key_name=$1
+		ORDER BY key_version DESC
+	`, p.KeyName)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []string{}
+	for rows.Next() {
+		var keyValue string
+		if rows.Scan(&keyValue) == nil {
+			out = append(out, legacyDeterministicToken(keyValue, plaintext))
+		}
+	}
+	if len(out) == 0 && strings.TrimSpace(p.FallbackSeed) != "" {
+		out = append(out, legacyDeterministicToken(p.FallbackSeed, plaintext))
+	}
+	if len(out) == 0 {
+		return nil, errors.New("no key versions available")
+	}
+	return out, nil
+}
+
+func deterministicToken(version int, keyMaterial, plaintext string) string {
+	return fmt.Sprintf("tk%d:%s", version, legacyDeterministicToken(keyMaterial, plaintext))
+}
+
+func legacyDeterministicToken(keyMaterial, plaintext string) string {
+	mac := hmac.New(sha256.New, []byte("deterministic:"+keyMaterial))
+	_, _ = mac.Write([]byte(strings.TrimSpace(plaintext)))
+	return hex.EncodeToString(mac.Sum(nil))
 }
 
 func (p *PIIProtector) EnsureBootstrapKey() error {
@@ -83,6 +209,12 @@ func (p *PIIProtector) EnsureBootstrapKey() error {
 }
 
 func (p *PIIProtector) activeKey(ctx context.Context) (int, string, error) {
+	if p.DB == nil {
+		if strings.TrimSpace(p.FallbackSeed) == "" {
+			return 0, "", errors.New("no active encryption key")
+		}
+		return 1, p.FallbackSeed, nil
+	}
 	var version int
 	var keyValue string
 	err := p.DB.QueryRowContext(ctx, `
@@ -105,6 +237,12 @@ func (p *PIIProtector) activeKey(ctx context.Context) (int, string, error) {
 }
 
 func (p *PIIProtector) keyByVersion(ctx context.Context, version int) (string, error) {
+	if p.DB == nil {
+		if strings.TrimSpace(p.FallbackSeed) == "" || version != 1 {
+			return "", sql.ErrNoRows
+		}
+		return p.FallbackSeed, nil
+	}
 	var keyValue string
 	err := p.DB.QueryRowContext(ctx, `
 		SELECT key_value
@@ -166,4 +304,29 @@ func open(keyMaterial, encoded string) (string, error) {
 func deriveKey(seed string) []byte {
 	h := sha256.Sum256([]byte(seed))
 	return h[:]
+}
+
+func HashOpaqueToken(token string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(token)))
+	return hex.EncodeToString(sum[:])
+}
+
+func parseEncryptedEnvelope(stored string) (int, string, error) {
+	parts := strings.SplitN(strings.TrimSpace(stored), ":", 2)
+	if len(parts) != 2 || len(parts[0]) < 2 || parts[0][0] != 'k' {
+		return 0, "", errors.New("invalid encrypted payload format")
+	}
+	for _, r := range parts[0][1:] {
+		if r < '0' || r > '9' {
+			return 0, "", errors.New("invalid encrypted payload version")
+		}
+	}
+	version, err := strconv.Atoi(parts[0][1:])
+	if err != nil {
+		return 0, "", err
+	}
+	if strings.TrimSpace(parts[1]) == "" {
+		return 0, "", errors.New("invalid encrypted payload body")
+	}
+	return version, parts[1], nil
 }
