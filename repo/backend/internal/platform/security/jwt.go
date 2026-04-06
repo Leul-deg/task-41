@@ -30,12 +30,17 @@ func (tm *TokenManager) CreateAccessToken(userID, username string, ttl time.Dura
 }
 
 func (tm *TokenManager) CreateStepUpToken(userID, actionClass string, ttl time.Duration) (string, error) {
+	nonce, err := NewOpaqueToken()
+	if err != nil {
+		return "", err
+	}
 	claims := jwt.MapClaims{
 		"sub":          userID,
 		"kind":         "step_up",
 		"action_class": actionClass,
 		"exp":          time.Now().Add(ttl).Unix(),
 		"iat":          time.Now().Unix(),
+		"jti":          nonce,
 	}
 	t := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	return t.SignedString(tm.secret)

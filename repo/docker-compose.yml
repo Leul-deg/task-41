@@ -5,8 +5,6 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-meridian}
       POSTGRES_USER: ${POSTGRES_USER:-meridian}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-meridian}
-    ports:
-      - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:

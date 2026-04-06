@@ -150,6 +150,7 @@ class APITestRunner:
         )
         if self._expect_status("hiring.create_application_manual", status, 201, body) and isinstance(body, dict):
             self.ctx["application_id"] = body.get("application_id")
+            self.ctx["candidate_id"] = body.get("candidate_id")
 
         status, body = self._request("GET", "/rpc/api/hiring/applications", token=token)
         ok = status == 200 and isinstance(body, dict) and any(a.get("application_id") == self.ctx.get("application_id") for a in body.get("applications", []))
@@ -319,7 +320,12 @@ class APITestRunner:
         status, body = self._request("POST", "/rpc/api/compliance/deletion-requests", {}, token=token)
         self._expect_status("compliance.create_deletion_missing_subject", status, 400, body)
 
-        status, body = self._request("POST", "/rpc/api/compliance/deletion-requests", {"subject_ref": self.ctx.get("admin_user_id") or "11111111-1111-1111-1111-111111111111"}, token=token)
+        status, body = self._request(
+            "POST",
+            "/rpc/api/compliance/deletion-requests",
+            {"subject_ref": self.ctx.get("candidate_id") or "11111111-1111-1111-1111-111111111111"},
+            token=token,
+        )
         if self._expect_status("compliance.create_deletion_request", status, 201, body) and isinstance(body, dict):
             self.ctx["deletion_id"] = body.get("id")
 

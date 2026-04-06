@@ -6,6 +6,72 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TOTAL=0
 PASSED=0
 FAILED=0
+STACK_STARTED_BY_SCRIPT=0
+
+have_cmd() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+have_docker_compose() {
+  if ! have_cmd docker; then
+    return 1
+  fi
+  docker compose version >/dev/null 2>&1
+}
+
+wait_for_url() {
+  local url="$1"
+  local attempts="${2:-90}"
+  local delay_sec="${3:-1}"
+  local i
+
+  for ((i = 1; i <= attempts; i++)); do
+    if curl -fsS --max-time 2 "${url}" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep "${delay_sec}"
+  done
+  return 1
+}
+
+start_stack_for_api_tests_if_needed() {
+  if wait_for_url "http://localhost:8081/" 1 1; then
+    return 0
+  fi
+
+  if ! have_docker_compose; then
+    echo "WARN: docker compose unavailable and frontend is not reachable at http://localhost:8081/"
+    echo "WARN: API tests may fail unless the stack is started manually"
+    return 0
+  fi
+
+  echo "=== Starting docker compose stack for API tests ==="
+  if ! docker compose -f "${ROOT_DIR}/docker-compose.yml" up -d --build; then
+    echo "ERROR: docker compose up failed"
+    return 1
+  fi
+  STACK_STARTED_BY_SCRIPT=1
+
+  if ! wait_for_url "http://localhost:8081/" 120 1; then
+    echo "ERROR: frontend did not become ready at http://localhost:8081/"
+    return 1
+  fi
+  if ! wait_for_url "http://localhost:8080/healthz" 120 1; then
+    echo "ERROR: backend did not become ready at http://localhost:8080/healthz"
+    return 1
+  fi
+
+  return 0
+}
+
+cleanup_stack() {
+  if [[ "${STACK_STARTED_BY_SCRIPT}" -eq 1 ]] && have_docker_compose; then
+    echo "=== Stopping docker compose stack started by run_tests.sh ==="
+    docker compose -f "${ROOT_DIR}/docker-compose.yml" down -v >/dev/null 2>&1 || true
+  fi
+}
+
+trap cleanup_stack EXIT
 
 run_suite() {
   local name="$1"
@@ -49,6 +115,13 @@ run_suite() {
 }
 
 run_suite "unit_tests" "${ROOT_DIR}/unit_tests/run_unit_tests.sh"
+if ! start_stack_for_api_tests_if_needed; then
+  echo "=== Final Summary ==="
+  echo "TOTAL=1"
+  echo "PASSED=0"
+  echo "FAILED=1"
+  exit 1
+fi
 run_suite "API_tests" "${ROOT_DIR}/API_tests/run_api_tests.sh"
 
 echo "=== Final Summary ==="
