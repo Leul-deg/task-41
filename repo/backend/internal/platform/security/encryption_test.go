@@ -56,3 +56,24 @@ func TestIsEncryptedValue_RejectsPlaintextStartingWithK(t *testing.T) {
 		t.Fatalf("expected valid encrypted payload to be recognized")
 	}
 }
+
+func TestDecryptKeyMaterial_FailsWithWrongMasterKey(t *testing.T) {
+	t.Setenv("SECRET_MASTER_KEY", "master-a")
+	sealed, err := NewSecretStoreProtector("master-a").EncryptIfNeeded("seed-v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("SECRET_MASTER_KEY", "master-b")
+	p := NewPIIProtector(nil, "PII_TEST", "fallback")
+	if _, err := p.decryptKeyMaterial(sealed); err == nil {
+		t.Fatalf("expected decryption failure with wrong master key")
+	}
+}
+
+func TestVerifyActiveKeyMaterial_RoundTrip(t *testing.T) {
+	p := NewPIIProtector(nil, "PII_TEST", "test-seed")
+	if err := p.VerifyActiveKeyMaterial(); err != nil {
+		t.Fatalf("expected key material verification to pass, got %v", err)
+	}
+}

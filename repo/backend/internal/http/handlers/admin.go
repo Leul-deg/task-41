@@ -7,14 +7,16 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"meridian/backend/internal/platform/security"
 )
 
 type AdminHandler struct {
-	DB *sql.DB
+	DB          *sql.DB
+	SecretStore *security.SecretStoreProtector
 }
 
-func NewAdminHandler(db *sql.DB) *AdminHandler {
-	return &AdminHandler{DB: db}
+func NewAdminHandler(db *sql.DB, secretStore *security.SecretStoreProtector) *AdminHandler {
+	return &AdminHandler{DB: db, SecretStore: secretStore}
 }
 
 func (h *AdminHandler) ListRoles(c *gin.Context) {
@@ -142,7 +144,16 @@ func (h *AdminHandler) RotateClientKey(c *gin.Context) {
 		seed = seed[:8]
 	}
 	newKeyID := req.KeyName + "-v" + seed
-	_, err := h.DB.Exec(`INSERT INTO client_keys(id, key_id, secret, created_at) VALUES ($1,$2,$3,now())`, uuid.NewString(), newKeyID, req.Secret)
+	sealed := req.Secret
+	if h.SecretStore != nil {
+		var serr error
+		sealed, serr = h.SecretStore.EncryptIfNeeded(req.Secret)
+		if serr != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "failed to secure key secret"})
+			return
+		}
+	}
+	_, err := h.DB.Exec(`INSERT INTO client_keys(id, key_id, secret, created_at) VALUES ($1,$2,$3,now())`, uuid.NewString(), newKeyID, sealed)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to rotate key"})
 		return

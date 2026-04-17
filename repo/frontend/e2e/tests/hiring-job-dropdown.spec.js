@@ -60,16 +60,14 @@ test("hiring dropdown shows access denied on 403", async ({ page }) => {
   await login(page, "admin");
   await mockApplications(page);
 
-  await page.route("**/rpc/api/hiring/jobs*", async (route) => {
-    const url = route.request().url();
-    if (url.includes("/for-intake")) {
-      await route.fulfill({
-        status: 403,
-        contentType: "application/json",
-        body: JSON.stringify({ error: "forbidden", code: "FORBIDDEN_SCOPE" }),
-      });
-      return;
-    }
+  await page.route("**/rpc/api/hiring/jobs", async (route) => {
+    await route.fulfill({
+      status: 403,
+      contentType: "application/json",
+      body: JSON.stringify({ error: "forbidden", code: "FORBIDDEN_SCOPE" }),
+    });
+  });
+  await page.route("**/rpc/api/hiring/jobs/for-intake", async (route) => {
     await route.fulfill({
       status: 403,
       contentType: "application/json",

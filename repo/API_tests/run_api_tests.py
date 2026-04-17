@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+import base64
+import hashlib
 import json
 import os
 import sys
@@ -116,6 +118,13 @@ class APITestRunner:
         status, body = self._request("POST", "/rpc/api/compliance/crawler/run", {}, token=recruiter)
         self._expect_status("auth.permission_denied_recruiter_compliance", status, 403, body)
 
+        status, body = self._request("POST", "/rpc/logout", {})
+        self._expect_status("bff.rpc_logout", status, 200, body)
+
+        status, body = self._request("POST", "/rpc/refresh", {})
+        ok = status in (400, 401)
+        self._record("bff.rpc_refresh_no_cookie", ok, f"expected 400 or 401 for refresh without cookie, got {status}" if not ok else "")
+
     def test_hiring(self):
         token = self.tokens["admin"]
         suffix = str(uuid.uuid4())[:8]
@@ -129,12 +138,34 @@ class APITestRunner:
         if self._expect_status("hiring.create_job", status, 201, body) and isinstance(body, dict):
             self.ctx["job_id"] = body.get("id")
 
+        status, body = self._request(
+            "POST",
+            "/rpc/api/hiring/jobs",
+            {"code": f"API-H-FOREIGN-{suffix}", "title": "Foreign Site Job", "description": "scope isolation check", "site_code": "SITE-B"},
+            token=token,
+        )
+        if self._expect_status("hiring.create_foreign_site_job", status, 201, body) and isinstance(body, dict):
+            self.ctx["foreign_job_id"] = body.get("id")
+
         status, body = self._request("GET", "/rpc/api/hiring/jobs", token=token)
         ok = status == 200 and isinstance(body, dict) and any(j.get("id") == self.ctx.get("job_id") for j in body.get("jobs", []))
         self._record("hiring.list_jobs_post_create_state", ok, "created job not found in jobs list" if not ok else "", self._snippet(body) if not ok else "")
 
         status, body = self._request("POST", "/rpc/api/hiring/jobs", {"code": 1234}, token=token)
         self._expect_status("hiring.create_job_invalid_payload_type", status, 400, body)
+
+        recruiter = self.tokens.get("recruiter1")
+        if recruiter and self.ctx.get("foreign_job_id"):
+            status, body = self._request(
+                "POST",
+                "/rpc/api/hiring/applications/import-csv",
+                {
+                    "job_id": self.ctx.get("foreign_job_id"),
+                    "csv": "full_name,email,phone\\nScope Test,scope@example.com,5551112222\\n",
+                },
+                token=recruiter,
+            )
+            self._expect_status("hiring.csv_import_out_of_scope_forbidden", status, 403, body)
 
         status, body = self._request(
             "POST",
@@ -155,6 +186,69 @@ class APITestRunner:
         status, body = self._request("GET", "/rpc/api/hiring/applications", token=token)
         ok = status == 200 and isinstance(body, dict) and any(a.get("application_id") == self.ctx.get("application_id") for a in body.get("applications", []))
         self._record("hiring.list_applications_post_create_state", ok, "created application not found in application list" if not ok else "", self._snippet(body) if not ok else "")
+
+        status, body = self._request("GET", "/rpc/api/hiring/pipelines/templates", token=token)
+        self._expect_status("hiring.list_pipeline_templates", status, 200, body)
+        if status == 200 and isinstance(body, dict):
+            templates = self._dict_list(body, "templates")
+            if templates:
+                tpl_id = templates[0].get("id")
+                if tpl_id:
+                    s2, b2 = self._request("GET", f"/rpc/api/hiring/pipelines/templates/{tpl_id}", token=token)
+                    self._expect_status("hiring.get_pipeline_template_by_id", s2, 200, b2)
+
+        tpl_suffix = str(uuid.uuid4())[:8]
+        tpl_stages = [
+            {"code": f"SCREEN-{tpl_suffix}", "name": "Screening", "order_index": 1, "terminal": False},
+            {"code": f"OFFER-{tpl_suffix}", "name": "Offer", "order_index": 2, "terminal": False},
+            {"code": f"HIRED-{tpl_suffix}", "name": "Hired", "order_index": 3, "terminal": True, "outcome": "success"},
+            {"code": f"REJECT-{tpl_suffix}", "name": "Rejected", "order_index": 4, "terminal": True, "outcome": "failure"},
+        ]
+        tpl_transitions = [
+            {"from_stage_code": f"SCREEN-{tpl_suffix}", "to_stage_code": f"OFFER-{tpl_suffix}"},
+            {"from_stage_code": f"OFFER-{tpl_suffix}", "to_stage_code": f"HIRED-{tpl_suffix}"},
+            {"from_stage_code": f"OFFER-{tpl_suffix}", "to_stage_code": f"REJECT-{tpl_suffix}"},
+        ]
+        s3, b3 = self._request(
+            "POST", "/rpc/api/hiring/pipelines/templates",
+            {"code": f"API-TPL-{tpl_suffix}", "name": f"API Test Template {tpl_suffix}", "stages": tpl_stages, "transitions": tpl_transitions},
+            token=token,
+        )
+        if self._expect_status("hiring.create_pipeline_template", s3, 201, b3) and isinstance(b3, dict):
+            new_tpl_id = b3.get("id")
+            if new_tpl_id:
+                self.ctx["new_tpl_id"] = new_tpl_id
+                s4, b4 = self._request(
+                    "PUT", f"/rpc/api/hiring/pipelines/templates/{new_tpl_id}",
+                    {"code": f"API-TPL-{tpl_suffix}-UPD", "name": f"Updated Template {tpl_suffix}", "stages": tpl_stages, "transitions": tpl_transitions},
+                    token=token,
+                )
+                self._expect_status("hiring.update_pipeline_template", s4, 200, b4)
+
+        s5, b5 = self._request("GET", "/rpc/api/hiring/jobs/for-intake", token=token)
+        self._expect_status("hiring.list_jobs_for_intake", s5, 200, b5)
+
+        if self.ctx.get("candidate_id"):
+            status, body = self._request("GET", f"/rpc/api/hiring/candidates/{self.ctx.get('candidate_id')}", token=token)
+            self._expect_status("hiring.get_candidate", status, 200, body)
+
+        if self.ctx.get("application_id"):
+            status, body = self._request("GET", f"/rpc/api/hiring/applications/{self.ctx.get('application_id')}/allowed-transitions", token=token)
+            self._expect_status("hiring.get_allowed_transitions", status, 200, body)
+
+            if status == 200 and isinstance(body, dict) and body.get("allowed_transitions"):
+                first_trans = body["allowed_transitions"][0]
+                cur_stage = body.get("current_stage", "SCREENING")
+                status2, body2 = self._request(
+                    "POST",
+                    f"/rpc/api/hiring/applications/{self.ctx.get('application_id')}/transition",
+                    {"from_stage": cur_stage, "to_stage": first_trans.get("to_stage"), "fields": {"notes": "api test transition"}},
+                    token=token,
+                )
+                self._expect_status("hiring.transition_application", status2, 200, body2)
+
+            status, body = self._request("GET", f"/rpc/api/hiring/applications/{self.ctx.get('application_id')}/events", token=token)
+            self._expect_status("hiring.get_pipeline_events", status, 200, body)
 
     def test_admin(self):
         token = self.tokens["admin"]
@@ -204,7 +298,33 @@ class APITestRunner:
         )
         self._expect_status("admin.update_role_scopes", status, 200, body)
 
+        status, body = self._request("POST", "/rpc/api/auth/step-up", {"password": "LocalAdminPass123!", "action_class": "role_permission_change"}, token=token)
+        step_ok = self._expect_status("admin.obtain_stepup_rotate", status, 200, body)
+        rotate_step = body.get("step_up_token") if step_ok and isinstance(body, dict) else ""
+
+        if rotate_step:
+            key_suffix = str(uuid.uuid4())[:8]
+            status, body = self._request(
+                "POST", "/rpc/api/admin/client-keys/rotate",
+                {"key_name": f"api-test-key-{key_suffix}", "secret": "api-test-secret"},
+                token=token, step_up=rotate_step,
+            )
+            if self._expect_status("admin.rotate_client_key", status, 201, body) and isinstance(body, dict):
+                new_key_id = body.get("key_id", "")
+                status, body = self._request("POST", "/rpc/api/auth/step-up", {"password": "LocalAdminPass123!", "action_class": "delete_or_reversal"}, token=token)
+                step_ok2 = self._expect_status("admin.obtain_stepup_revoke", status, 200, body)
+                revoke_step = body.get("step_up_token") if step_ok2 and isinstance(body, dict) else ""
+                if revoke_step and new_key_id:
+                    status, body = self._request(
+                        "POST", f"/rpc/api/admin/client-keys/{new_key_id}/revoke", {},
+                        token=token, step_up=revoke_step,
+                    )
+                    self._expect_status("admin.revoke_client_key", status, 200, body)
+
     def test_kiosk(self):
+        status, body = self._request("GET", "/rpc/kiosk/jobs")
+        self._expect_status("kiosk.list_public_jobs", status, 200, body)
+
         status, body = self._request("POST", "/rpc/api/hiring/applications/kiosk", {"job_id": self.ctx.get("job_id")})
         self._expect_status("kiosk.authenticated_endpoint_requires_auth", status, 401, body)
 
@@ -258,6 +378,64 @@ class APITestRunner:
         status, body = self._request("GET", "/rpc/api/support/tickets/00000000-0000-0000-0000-000000000000", token=token)
         self._expect_status("support.get_ticket_not_found", status, 404, body)
 
+        status, body = self._request("GET", "/rpc/api/support/tickets", token=token)
+        self._expect_status("support.list_tickets", status, 200, body)
+
+        status, body = self._request("GET", "/rpc/api/support/orders", token=token)
+        self._expect_status("support.list_orders", status, 200, body)
+
+        status, body = self._request("GET", "/rpc/api/support/orders/for-intake", token=token)
+        self._expect_status("support.list_orders_for_intake", status, 200, body)
+
+        if self.ctx.get("ticket_id"):
+            status, body = self._request(
+                "POST",
+                f"/rpc/api/support/tickets/{self.ctx.get('ticket_id')}/conflict-resolve",
+                {"current_version": 1, "expected_version": 999, "mode": "discard", "description": "api test discard"},
+                token=token,
+            )
+            self._expect_status("support.conflict_resolve_discard", status, 200, body)
+
+            _att_raw = b"api-test-attachment"
+            _att_b64 = base64.b64encode(_att_raw).decode()
+            _att_cksum = hashlib.sha256(_att_raw).hexdigest()
+            status, body = self._request(
+                "POST",
+                f"/rpc/api/support/tickets/{self.ctx.get('ticket_id')}/attachments",
+                {
+                    "file_name": "api_test.pdf",
+                    "mime_type": "application/pdf",
+                    "size_mb": 1,
+                    "size_bytes": len(_att_raw),
+                    "checksum": _att_cksum,
+                    "content_base64": _att_b64,
+                },
+                token=token,
+            )
+            self._expect_status("support.add_attachment_success", status, 201, body)
+
+        status, body = self._request(
+            "POST", "/rpc/api/support/tickets/refund-approve",
+            {"ticket_id": self.ctx.get("ticket_id"), "note": "test refund"},
+            token=token,
+            idem_key=f"idem-refund-no-step-{self.ctx.get('ticket_id', 'missing')}",
+        )
+        self._expect_status("support.refund_approve_no_stepup", status, 403, body)
+
+        status, body = self._request("POST", "/rpc/api/auth/step-up", {"password": "LocalAdminPass123!", "action_class": "refund_approval"}, token=token)
+        step_ok = self._expect_status("support.obtain_stepup_refund", status, 200, body)
+        refund_step = body.get("step_up_token") if step_ok and isinstance(body, dict) else ""
+
+        if refund_step and self.ctx.get("ticket_id"):
+            status, body = self._request(
+                "POST", "/rpc/api/support/tickets/refund-approve",
+                {"ticket_id": self.ctx.get("ticket_id"), "note": "approved via api test"},
+                token=token,
+                step_up=refund_step,
+                idem_key=f"idem-refund-step-{self.ctx.get('ticket_id', 'missing')}",
+            )
+            self._expect_status("support.refund_approve_with_stepup", status, 200, body)
+
     def test_inventory(self):
         token = self.tokens["admin"]
         order_id = f"ORD-API-{str(uuid.uuid4())[:8]}"
@@ -284,6 +462,46 @@ class APITestRunner:
         status, body = self._request("POST", "/rpc/api/inventory/reservations/order-create", {"order_id": order_id, "sku": "SKU-100", "quantity": "bad-type", "site_code": "SITE-A"}, token=token, idem_key=f"idem-invalid-{order_id}")
         self._expect_status("inventory.create_reservation_invalid_quantity_type", status, 400, body)
 
+        confirm_order = f"ORD-CF-{str(uuid.uuid4())[:8]}"
+        status, body = self._request(
+            "POST", "/rpc/api/inventory/reservations/order-create",
+            {"order_id": confirm_order, "sku": "SKU-100", "quantity": 2, "site_code": "SITE-A"},
+            token=token, idem_key=f"idem-cf-{confirm_order}",
+        )
+        if status == 201:
+            _, list_body = self._request("GET", "/rpc/api/inventory/reservations", token=token)
+            confirm_res_id = next(
+                (r.get("id") for r in self._dict_list(list_body, "reservations") if r.get("order_id") == confirm_order),
+                None,
+            )
+            if confirm_res_id:
+                status, body = self._request(
+                    "POST", f"/rpc/api/inventory/reservations/{confirm_res_id}/confirm",
+                    {"confirmed_qty": 2, "reason_code": "API_CF"},
+                    token=token,
+                )
+                self._expect_status("inventory.confirm_reservation", status, 200, body)
+
+        release_order = f"ORD-RL-{str(uuid.uuid4())[:8]}"
+        status, body = self._request(
+            "POST", "/rpc/api/inventory/reservations/order-create",
+            {"order_id": release_order, "sku": "SKU-100", "quantity": 1, "site_code": "SITE-A"},
+            token=token, idem_key=f"idem-rl-{release_order}",
+        )
+        if status == 201:
+            _, list_body = self._request("GET", "/rpc/api/inventory/reservations", token=token)
+            release_res_id = next(
+                (r.get("id") for r in self._dict_list(list_body, "reservations") if r.get("order_id") == release_order),
+                None,
+            )
+            if release_res_id:
+                status, body = self._request(
+                    "POST", f"/rpc/api/inventory/reservations/{release_res_id}/release",
+                    {"reason_code": "API_RL"},
+                    token=token,
+                )
+                self._expect_status("inventory.release_reservation", status, 200, body)
+
         status, body = self._request("POST", "/rpc/api/inventory/reservations/order-cancel", {"order_id": order_id}, token=token)
         self._expect_status("inventory.cancel_order_reservations", status, 200, body)
 
@@ -299,6 +517,36 @@ class APITestRunner:
             token=token,
         )
         self._expect_status("inventory.transfer_between_warehouses", status, 201, body)
+
+        status, body = self._request(
+            "POST",
+            "/rpc/api/inventory/inbound",
+            {"sku": "SKU-100", "quantity": 5, "to_warehouse": "WH-1", "reason_code": "API_INBOUND_TEST"},
+            token=token,
+        )
+        self._expect_status("inventory.inbound_move", status, 201, body)
+
+        status, body = self._request("GET", "/rpc/api/inventory/orders/for-intake", token=token)
+        self._expect_status("inventory.list_orders_for_intake", status, 200, body)
+
+        status, body = self._request(
+            "POST", "/rpc/api/inventory/ledger/00000000-0000-0000-0000-000000000000/reverse",
+            {"reason_code": "DATA_ERROR"},
+            token=token,
+        )
+        self._expect_status("inventory.ledger_reverse_no_stepup", status, 403, body)
+
+        status, body = self._request("POST", "/rpc/api/auth/step-up", {"password": "LocalAdminPass123!", "action_class": "delete_or_reversal"}, token=token)
+        step_ok = self._expect_status("inventory.obtain_stepup_reversal", status, 200, body)
+        reversal_step = body.get("step_up_token") if step_ok and isinstance(body, dict) else ""
+
+        if reversal_step:
+            status, body = self._request(
+                "POST", "/rpc/api/inventory/ledger/00000000-0000-0000-0000-000000000000/reverse",
+                {"reason_code": "DATA_ERROR"},
+                token=token, step_up=reversal_step,
+            )
+            self._expect_status("inventory.ledger_reverse_notfound", status, 404, body)
 
         status, body = self._request("GET", "/rpc/api/inventory/balances?site=SITE-A", token=token)
         balances_ok = status == 200 and isinstance(body, dict) and len(self._dict_list(body, "balances")) > 0
@@ -356,6 +604,29 @@ class APITestRunner:
                     completed = True
                     break
         self._record("compliance.post_process_state_completed", status == 200 and completed, "deletion request not completed after processing" if not (status == 200 and completed) else "", self._snippet(body) if not (status == 200 and completed) else "")
+
+        status, body = self._request("GET", "/rpc/api/compliance/audit-logs", token=token)
+        self._expect_status("compliance.audit_logs", status, 200, body)
+
+        status, body = self._request("GET", "/rpc/api/compliance/retention/jobs", token=token)
+        self._expect_status("compliance.retention_jobs", status, 200, body)
+
+        status, body = self._request("GET", "/rpc/api/compliance/crawler/status", token=token)
+        self._expect_status("compliance.crawler_status", status, 200, body)
+
+        status, body = self._request("POST", "/rpc/api/compliance/crawler/run", {}, token=token)
+        self._expect_status("compliance.crawler_run", status, 200, body)
+
+        status, body = self._request("GET", "/rpc/api/compliance/audit-logs/export", token=token)
+        self._expect_status("compliance.audit_export_no_stepup", status, 403, body)
+
+        status, body = self._request("POST", "/rpc/api/auth/step-up", {"password": "LocalAdminPass123!", "action_class": "export"}, token=token)
+        step_ok = self._expect_status("compliance.obtain_stepup_export", status, 200, body)
+        export_step = body.get("step_up_token") if step_ok and isinstance(body, dict) else ""
+
+        if export_step:
+            status, body = self._request("GET", "/rpc/api/compliance/audit-logs/export", token=token, step_up=export_step)
+            self._expect_status("compliance.audit_export_with_stepup", status, 200, body)
 
     def run(self):
         print("[api_tests] starting")

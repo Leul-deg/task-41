@@ -35,17 +35,17 @@ wait_for_url() {
 }
 
 start_stack_for_api_tests_if_needed() {
-  if wait_for_url "http://localhost:8081/" 1 1; then
+  if wait_for_url "http://localhost:8081/" 1 1 && wait_for_url "http://localhost:8080/healthz" 1 1; then
     return 0
   fi
 
   if ! have_docker_compose; then
-    echo "WARN: docker compose unavailable and frontend is not reachable at http://localhost:8081/"
-    echo "WARN: API tests may fail unless the stack is started manually"
-    return 0
+    echo "ERROR: docker compose unavailable and services are not reachable at http://localhost:8081/ and http://localhost:8080/healthz"
+    return 1
   fi
 
   echo "=== Starting docker compose stack for API tests ==="
+  docker compose -f "${ROOT_DIR}/docker-compose.yml" down -v --remove-orphans >/dev/null 2>&1 || true
   if ! docker compose -f "${ROOT_DIR}/docker-compose.yml" up -d --build; then
     echo "ERROR: docker compose up failed"
     return 1
@@ -123,6 +123,7 @@ if ! start_stack_for_api_tests_if_needed; then
   exit 1
 fi
 run_suite "API_tests" "${ROOT_DIR}/API_tests/run_api_tests.sh"
+run_suite "e2e_tests" "${ROOT_DIR}/e2e_tests/run_e2e_tests.sh"
 
 echo "=== Final Summary ==="
 echo "TOTAL=${TOTAL}"

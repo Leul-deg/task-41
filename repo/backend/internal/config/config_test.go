@@ -6,6 +6,7 @@ func TestValidateSecurity_AllowsDevDefaults(t *testing.T) {
 	c := Config{
 		AppEnv:             "dev",
 		JWTSecret:          "change-this-jwt-secret",
+		SecretMasterKey:    "change-this-secret-master-key",
 		BootstrapClientSec: "local-h5-secret-change-me",
 		DefaultAdminPass:   "LocalAdminPass123!",
 		PIIKeyValue:        "change-this-local-pii-key",
@@ -20,6 +21,7 @@ func TestValidateSecurity_RejectsProdDefaults(t *testing.T) {
 	c := Config{
 		AppEnv:             "prod",
 		JWTSecret:          "change-this-jwt-secret",
+		SecretMasterKey:    "change-this-secret-master-key",
 		BootstrapClientSec: "local-h5-secret-change-me",
 		DefaultAdminPass:   "LocalAdminPass123!",
 		PIIKeyValue:        "change-this-local-pii-key",

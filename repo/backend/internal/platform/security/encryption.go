@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strconv"
 	"strings"
 
@@ -127,6 +128,10 @@ func (p *PIIProtector) DeterministicTokens(plaintext string) ([]string, error) {
 		var version int
 		var keyValue string
 		if rows.Scan(&version, &keyValue) == nil {
+			keyValue, err = p.decryptKeyMaterial(keyValue)
+			if err != nil {
+				return nil, err
+			}
 			out = append(out, deterministicToken(version, keyValue, plaintext))
 		}
 	}
@@ -165,6 +170,10 @@ func (p *PIIProtector) LegacyDeterministicTokens(plaintext string) ([]string, er
 	for rows.Next() {
 		var keyValue string
 		if rows.Scan(&keyValue) == nil {
+			keyValue, err = p.decryptKeyMaterial(keyValue)
+			if err != nil {
+				return nil, err
+			}
 			out = append(out, legacyDeterministicToken(keyValue, plaintext))
 		}
 	}
@@ -201,10 +210,14 @@ func (p *PIIProtector) EnsureBootstrapKey() error {
 	if exists {
 		return nil
 	}
+	sealed, err := NewSecretStoreProtector(strings.TrimSpace(os.Getenv("SECRET_MASTER_KEY"))).EncryptIfNeeded(p.FallbackSeed)
+	if err != nil {
+		return err
+	}
 	_, err = p.DB.Exec(`
 		INSERT INTO encryption_keys(id, key_name, key_version, key_value, status, valid_from, created_at)
 		VALUES ($1,$2,1,$3,'ACTIVE',now(),now())
-	`, uuid.NewString(), p.KeyName, p.FallbackSeed)
+	`, uuid.NewString(), p.KeyName, sealed)
 	return err
 }
 
@@ -233,6 +246,10 @@ func (p *PIIProtector) activeKey(ctx context.Context) (int, string, error) {
 	if err != nil {
 		return 0, "", err
 	}
+	keyValue, err = p.decryptKeyMaterial(keyValue)
+	if err != nil {
+		return 0, "", err
+	}
 	return version, keyValue, nil
 }
 
@@ -253,7 +270,50 @@ func (p *PIIProtector) keyByVersion(ctx context.Context, version int) (string, e
 	if err == sql.ErrNoRows && strings.TrimSpace(p.FallbackSeed) != "" && version == 1 {
 		return p.FallbackSeed, nil
 	}
+	if err == nil {
+		keyValue, err = p.decryptKeyMaterial(keyValue)
+		if err != nil {
+			return "", err
+		}
+	}
 	return keyValue, err
+}
+
+func (p *PIIProtector) decryptKeyMaterial(value string) (string, error) {
+	store := NewSecretStoreProtector(strings.TrimSpace(os.Getenv("SECRET_MASTER_KEY")))
+	plain, err := store.DecryptIfNeeded(value)
+	if err != nil {
+		return "", err
+	}
+	if strings.HasPrefix(strings.TrimSpace(value), secretEnvelopePrefix) && strings.TrimSpace(plain) == "" {
+		return "", errors.New("decrypted key material is empty")
+	}
+	if strings.TrimSpace(plain) == "" {
+		return value, nil
+	}
+	return plain, nil
+}
+
+func (p *PIIProtector) VerifyActiveKeyMaterial() error {
+	if p == nil {
+		return errors.New("nil pii protector")
+	}
+	if _, _, err := p.activeKey(context.Background()); err != nil {
+		return err
+	}
+	probe := "key-material-probe"
+	enc, err := p.Encrypt(probe)
+	if err != nil {
+		return err
+	}
+	dec, err := p.Decrypt(enc)
+	if err != nil {
+		return err
+	}
+	if dec != probe {
+		return errors.New("active key material verification failed")
+	}
+	return nil
 }
 
 func seal(keyMaterial, plaintext string) (string, error) {

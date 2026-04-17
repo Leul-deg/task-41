@@ -36,15 +36,22 @@ func main() {
 	if err := db.Migrate(context.Background(), database, migrationDir); err != nil {
 		log.Fatalf("migration failed: %v", err)
 	}
+	secretStore := security.NewSecretStoreProtector(cfg.SecretMasterKey)
 
-	if err := bootstrap.SeedAdminAndKeys(database, cfg.DefaultAdminUser, cfg.DefaultAdminPass, cfg.BootstrapClientKey, cfg.BootstrapClientSec, cfg.PIIKeyName, cfg.PIIKeyValue); err != nil {
+	if err := bootstrap.SeedAdminAndKeys(database, cfg.DefaultAdminUser, cfg.DefaultAdminPass, cfg.BootstrapClientKey, cfg.BootstrapClientSec, cfg.PIIKeyName, cfg.PIIKeyValue, secretStore); err != nil {
 		log.Fatalf("bootstrap failed: %v", err)
+	}
+	if err := bootstrap.HardenSecretStorage(database, secretStore); err != nil {
+		log.Fatalf("secret hardening failed: %v", err)
 	}
 
 	tokens := security.NewTokenManager(cfg.JWTSecret)
 	pii := security.NewPIIProtector(database, cfg.PIIKeyName, cfg.PIIKeyValue)
 	if err := pii.EnsureBootstrapKey(); err != nil {
 		log.Fatalf("pii key bootstrap failed: %v", err)
+	}
+	if err := pii.VerifyActiveKeyMaterial(); err != nil {
+		log.Fatalf("pii key material verification failed: %v", err)
 	}
 	if err := service.NewHiringService(database, cfg.EnableFuzzyDedup, pii).RemediateLegacyIdentityData(); err != nil {
 		log.Fatalf("legacy hiring identity remediation failed: %v", err)
@@ -53,7 +60,7 @@ func main() {
 	hiringHandler := handlers.NewHiringHandler(database, cfg.EnableFuzzyDedup, pii)
 	supportHandler := handlers.NewSupportHandler(database, pii)
 	inventoryHandler := handlers.NewInventoryHandler(database)
-	adminHandler := handlers.NewAdminHandler(database)
+	adminHandler := handlers.NewAdminHandler(database, secretStore)
 	complianceHandler := handlers.NewComplianceHandler(database)
 
 	r := gin.Default()
@@ -92,7 +99,7 @@ func main() {
 	hiring.POST("/jobs", middleware.RequirePermission(database, "hiring", "create"), middleware.RequireScope(database, "hiring", "global", "site", "assigned"), hiringHandler.CreateJob)
 	hiring.POST("/applications/manual", middleware.RequirePermission(database, "hiring", "create"), middleware.RequireScope(database, "hiring", "global", "site", "assigned"), hiringHandler.CreateManualApplication)
 	hiring.POST("/applications/kiosk", middleware.RequirePermission(database, "hiring", "create"), middleware.RequireScope(database, "hiring", "global", "site"), hiringHandler.CreateKioskApplication)
-	hiring.POST("/applications/import-csv", middleware.RequirePermission(database, "hiring", "create"), hiringHandler.ImportCSV)
+	hiring.POST("/applications/import-csv", middleware.RequirePermission(database, "hiring", "create"), middleware.RequireScope(database, "hiring", "global", "site", "assigned"), hiringHandler.ImportCSV)
 	hiring.POST("/pipelines/templates", middleware.RequirePermission(database, "hiring", "update"), hiringHandler.CreatePipelineTemplate)
 	hiring.PUT("/pipelines/templates/:id", middleware.RequirePermission(database, "hiring", "update"), hiringHandler.UpdatePipelineTemplate)
 	hiring.POST("/pipelines/validate", middleware.RequirePermission(database, "hiring", "update"), hiringHandler.ValidatePipeline)

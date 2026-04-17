@@ -94,6 +94,8 @@ Protected route behavior:
 
 - Docker + Docker Compose
 - 4+ GB RAM for local containers
+- Python 3 (required for API test suite — `API_tests/run_api_tests.py`)
+- Node.js v16+ with `npm`/`npx` (required for E2E test suite — `frontend/e2e/`)
 
 ## Local Setup
 
@@ -152,6 +154,7 @@ Signing bootstrap key:
 - `APP_ENV`: runtime mode (`dev|local|test` allow local defaults; non-dev enforces secure secrets).
 - `PII_KEY_NAME`: encryption key namespace used for sensitive field encryption.
 - `PII_KEY_VALUE`: initial local key material for bootstrap/key version 1.
+- `SECRET_MASTER_KEY`: local master key used to encrypt stored signing secrets and encryption key material.
 - `KIOSK_SUBMIT_SECRET`: backend secret required for `/kiosk/applications`.
 - `H5_KIOSK_SUBMIT_SECRET`: frontend proxy secret sent as `X-Kiosk-Token` for kiosk submissions.
 
@@ -159,6 +162,7 @@ Signing bootstrap key:
 
 - For `APP_ENV=prod` (or any non-dev value), the API/worker fail fast unless these are rotated from defaults:
   - `JWT_SECRET`
+  - `SECRET_MASTER_KEY`
   - `BOOTSTRAP_CLIENT_SECRET`
   - `DEFAULT_ADMIN_PASSWORD`
   - `PII_KEY_VALUE`
@@ -179,6 +183,7 @@ Prerequisites for one-click run:
 - Go toolchain for native unit tests OR Docker (runner auto-fallback)
 - Native unit tests require Go `1.23+` (older versions fail on current backend/frontend modules).
 - To always run unit tests in the Go container, set `MERIDIAN_USE_DOCKER_GO=1` (Docker required).
+- `run_tests.sh` will not auto-start Docker by default; set `MERIDIAN_AUTO_START_STACK=1` to allow managed `docker compose up` during API/E2E runs.
 - Running app endpoints at `http://localhost:8081` (configure via `TEST_BASE_URL` if different)
 
 One-click command (from project root):
@@ -226,6 +231,7 @@ npm test
 
 Prerequisites:
 
+- Node.js v16+ with `npm` and `npx` on `$PATH`
 - Running stack reachable at `http://localhost:8081` (override with `E2E_BASE_URL`)
 - Default test password override via `E2E_PASSWORD`
 
@@ -311,11 +317,20 @@ Notes:
 
 ## CI
 
-- No repository-managed GitHub Actions workflow is enforced.
-- Run checks locally as needed:
-  - `cd backend && go test ./...`
-  - `cd ../frontend && go test ./...`
-  - optional browser E2E in `frontend/e2e`.
+GitHub Actions runs backend and frontend unit tests on every push and PR to `main`:
+
+```
+.github/workflows/ci.yml
+```
+
+Jobs:
+- `backend-unit-tests`: runs `go test ./...` in `backend/`
+- `frontend-unit-tests`: runs `go test ./...` in `frontend/`
+
+Local equivalents:
+- `cd backend && go test ./...`
+- `cd ../frontend && go test ./...`
+- optional browser E2E in `frontend/e2e`
 
 Sample login (via frontend RPC proxy):
 

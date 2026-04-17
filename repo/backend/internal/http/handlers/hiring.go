@@ -675,6 +675,12 @@ func (h *HiringHandler) createApplication(c *gin.Context, source string) {
 }
 
 func (h *HiringHandler) ImportCSV(c *gin.Context) {
+	access, err := h.loadAccess(c)
+	if err != nil {
+		c.JSON(http.StatusForbidden, gin.H{"error": "scope resolution failed"})
+		return
+	}
+
 	var req struct {
 		JobID string `json:"job_id"`
 		CSV   string `json:"csv"`
@@ -683,6 +689,16 @@ func (h *HiringHandler) ImportCSV(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid payload"})
 		return
 	}
+	allowed, aerr := h.canAccessJob(access, req.JobID)
+	if aerr != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid job_id"})
+		return
+	}
+	if !allowed {
+		c.JSON(http.StatusForbidden, gin.H{"error": "job outside scope"})
+		return
+	}
+
 	count, err := h.Svc.ImportCSV(req.JobID, strings.NewReader(req.CSV))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})

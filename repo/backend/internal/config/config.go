@@ -14,6 +14,7 @@ type Config struct {
 	Port               string
 	DatabaseURL        string
 	JWTSecret          string
+	SecretMasterKey    string
 	AccessTTL          time.Duration
 	RefreshTTL         time.Duration
 	StepUpTTL          time.Duration
@@ -34,6 +35,7 @@ func Load() Config {
 		Port:               getEnv("PORT", "8080"),
 		DatabaseURL:        getEnv("DATABASE_URL", "postgres://meridian:meridian@localhost:5432/meridian?sslmode=disable"),
 		JWTSecret:          getEnv("JWT_SECRET", "change-this-jwt-secret"),
+		SecretMasterKey:    getEnv("SECRET_MASTER_KEY", "change-this-secret-master-key"),
 		AccessTTL:          time.Duration(getEnvInt("ACCESS_TOKEN_TTL_MIN", 15)) * time.Minute,
 		RefreshTTL:         time.Duration(getEnvInt("REFRESH_TOKEN_TTL_HOURS", 168)) * time.Hour,
 		StepUpTTL:          time.Duration(getEnvInt("STEP_UP_TTL_MIN", 5)) * time.Minute,
@@ -53,6 +55,9 @@ func (c Config) ValidateSecurity() error {
 	if strings.TrimSpace(c.JWTSecret) == "" {
 		return errors.New("JWT_SECRET is required")
 	}
+	if strings.TrimSpace(c.SecretMasterKey) == "" {
+		return errors.New("SECRET_MASTER_KEY is required")
+	}
 	if strings.TrimSpace(c.BootstrapClientSec) == "" {
 		return errors.New("BOOTSTRAP_CLIENT_SECRET is required")
 	}
@@ -70,6 +75,9 @@ func (c Config) ValidateSecurity() error {
 
 	if c.JWTSecret == "change-this-jwt-secret" {
 		return fmt.Errorf("JWT_SECRET must be rotated for %s", c.AppEnv)
+	}
+	if c.SecretMasterKey == "change-this-secret-master-key" {
+		return fmt.Errorf("SECRET_MASTER_KEY must be rotated for %s", c.AppEnv)
 	}
 	if c.BootstrapClientSec == "local-h5-secret-change-me" {
 		return fmt.Errorf("BOOTSTRAP_CLIENT_SECRET must be rotated for %s", c.AppEnv)

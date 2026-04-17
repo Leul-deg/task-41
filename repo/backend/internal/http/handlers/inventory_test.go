@@ -176,6 +176,84 @@ func TestListOrders_GlobalScopeReturnsOrders(t *testing.T) {
 	}
 }
 
+func TestReverseLedger_NotFound_Returns404(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db, mock, _ := sqlmock.New()
+	defer db.Close()
+
+	h := NewInventoryHandler(db)
+
+	mock.ExpectQuery(`SELECT COALESCE\(site_code`).WithArgs("user-1").WillReturnRows(
+		sqlmock.NewRows([]string{"site_code", "warehouse_code"}).AddRow("SITE-A", ""),
+	)
+	mock.ExpectQuery(`SELECT scope, COALESCE\(scope_value,''\)`).WithArgs("user-1").WillReturnRows(
+		sqlmock.NewRows([]string{"scope", "scope_value"}).AddRow("global", ""),
+	)
+	mock.ExpectBegin()
+	mock.ExpectQuery("SELECT movement_type").
+		WithArgs("00000000-0000-0000-0000-000000000099").
+		WillReturnRows(sqlmock.NewRows([]string{"movement_type", "sku", "quantity", "warehouse_code"}))
+	mock.ExpectRollback()
+
+	r := gin.New()
+	r.Use(func(c *gin.Context) { c.Set("userID", "user-1"); c.Next() })
+	r.POST("/ledger/:id/reverse", h.ReverseLedger)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/ledger/00000000-0000-0000-0000-000000000099/reverse", bytes.NewBufferString(`{"reason_code":"DATA_ERROR"}`))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 got %d body=%s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReverseLedger_AlreadyReversed_Returns409(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db, mock, _ := sqlmock.New()
+	defer db.Close()
+
+	h := NewInventoryHandler(db)
+
+	mock.ExpectQuery(`SELECT COALESCE\(site_code`).WithArgs("user-1").WillReturnRows(
+		sqlmock.NewRows([]string{"site_code", "warehouse_code"}).AddRow("SITE-A", ""),
+	)
+	mock.ExpectQuery(`SELECT scope, COALESCE\(scope_value,''\)`).WithArgs("user-1").WillReturnRows(
+		sqlmock.NewRows([]string{"scope", "scope_value"}).AddRow("global", ""),
+	)
+	mock.ExpectBegin()
+	mock.ExpectQuery("SELECT movement_type").
+		WithArgs("00000000-0000-0000-0000-000000000001").
+		WillReturnRows(
+			sqlmock.NewRows([]string{"movement_type", "sku", "quantity", "warehouse_code"}).
+				AddRow("INBOUND", "SKU-100", 5, "WH-1"),
+		)
+	mock.ExpectQuery(`SELECT EXISTS`).
+		WithArgs("00000000-0000-0000-0000-000000000001").
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+	mock.ExpectRollback()
+
+	r := gin.New()
+	r.Use(func(c *gin.Context) { c.Set("userID", "user-1"); c.Next() })
+	r.POST("/ledger/:id/reverse", h.ReverseLedger)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/ledger/00000000-0000-0000-0000-000000000001/reverse", bytes.NewBufferString(`{"reason_code":"DUPLICATE"}`))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409 got %d body=%s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestReverseLedger_CreatesCompensatingEntry(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	db, mock, _ := sqlmock.New()

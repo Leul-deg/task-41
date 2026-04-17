@@ -191,8 +191,13 @@ func (h *SupportHandler) ListOrders(c *gin.Context) {
 	args := []any{}
 	if !access.Global {
 		if access.AssignedOnly {
-			query += ` WHERE id IN (SELECT entity_id FROM user_assignments WHERE user_id=$1::uuid AND entity_type='order') `
-			args = append(args, access.UserID)
+			if strings.HasSuffix(c.FullPath(), "/for-intake") {
+				query += ` WHERE site_code=$1 `
+				args = append(args, access.SiteCode)
+			} else {
+				query += ` WHERE id IN (SELECT entity_id FROM user_assignments WHERE user_id=$1::uuid AND entity_type='order') `
+				args = append(args, access.UserID)
+			}
 		} else {
 			query += ` WHERE site_code=$1 `
 			args = append(args, access.SiteCode)
@@ -310,7 +315,6 @@ func (h *SupportHandler) CreateTicket(c *gin.Context) {
 	if !access.Global {
 		req.BusinessSite = access.SiteCode
 	}
-
 	var orderSite string
 	if err := h.DB.QueryRow(`SELECT site_code FROM orders WHERE id=$1`, req.OrderID).Scan(&orderSite); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "order not found"})

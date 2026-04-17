@@ -7,10 +7,23 @@ import (
 	"meridian/backend/internal/platform/security"
 )
 
-func SeedAdminAndKeys(db *sql.DB, username, password, clientKey, clientSecret, piiKeyName, piiKeyValue string) error {
+func SeedAdminAndKeys(db *sql.DB, username, password, clientKey, clientSecret, piiKeyName, piiKeyValue string, secretStore *security.SecretStoreProtector) error {
 	passwordHash, err := security.HashPassword(password)
 	if err != nil {
 		return err
+	}
+
+	sealedClientSecret := clientSecret
+	sealedPIIValue := piiKeyValue
+	if secretStore != nil {
+		sealedClientSecret, err = secretStore.EncryptIfNeeded(clientSecret)
+		if err != nil {
+			return err
+		}
+		sealedPIIValue, err = secretStore.EncryptIfNeeded(piiKeyValue)
+		if err != nil {
+			return err
+		}
 	}
 
 	_, err = db.Exec(`
@@ -26,7 +39,7 @@ func SeedAdminAndKeys(db *sql.DB, username, password, clientKey, clientSecret, p
 		INSERT INTO client_keys(id, key_id, secret, created_at)
 		VALUES ($1,$2,$3,now())
 		ON CONFLICT (key_id) DO NOTHING
-	`, uuid.NewString(), clientKey, clientSecret)
+	`, uuid.NewString(), clientKey, sealedClientSecret)
 	if err != nil {
 		return err
 	}
@@ -35,7 +48,7 @@ func SeedAdminAndKeys(db *sql.DB, username, password, clientKey, clientSecret, p
 		INSERT INTO encryption_keys(id, key_name, key_version, key_value, status, valid_from, created_at)
 		VALUES ($1,$2,1,$3,'ACTIVE',now(),now())
 		ON CONFLICT (key_name, key_version) DO NOTHING
-	`, uuid.NewString(), piiKeyName, piiKeyValue)
+	`, uuid.NewString(), piiKeyName, sealedPIIValue)
 	if err != nil {
 		return err
 	}
@@ -171,4 +184,79 @@ func SeedAdminAndKeys(db *sql.DB, username, password, clientKey, clientSecret, p
 	`)
 
 	return err
+}
+
+func HardenSecretStorage(db *sql.DB, secretStore *security.SecretStoreProtector) error {
+	if db == nil || secretStore == nil {
+		return nil
+	}
+
+	clientRows, err := db.Query(`SELECT key_id, secret FROM client_keys WHERE revoked_at IS NULL`)
+	if err != nil {
+		return err
+	}
+	defer clientRows.Close()
+
+	type clientSecretRow struct {
+		keyID  string
+		secret string
+	}
+	clientSecrets := []clientSecretRow{}
+	for clientRows.Next() {
+		var row clientSecretRow
+		if clientRows.Scan(&row.keyID, &row.secret) == nil {
+			clientSecrets = append(clientSecrets, row)
+		}
+	}
+
+	for _, row := range clientSecrets {
+		sealed, err := secretStore.EncryptIfNeeded(row.secret)
+		if err != nil {
+			return err
+		}
+		if sealed == row.secret {
+			continue
+		}
+		if _, err := db.Exec(`UPDATE client_keys SET secret=$2 WHERE key_id=$1`, row.keyID, sealed); err != nil {
+			return err
+		}
+	}
+
+	keyRows, err := db.Query(`SELECT key_name, key_version, key_value FROM encryption_keys`)
+	if err != nil {
+		return err
+	}
+	defer keyRows.Close()
+
+	type encryptionKeyRow struct {
+		keyName    string
+		keyVersion int
+		keyValue   string
+	}
+	keyValues := []encryptionKeyRow{}
+	for keyRows.Next() {
+		var row encryptionKeyRow
+		if keyRows.Scan(&row.keyName, &row.keyVersion, &row.keyValue) == nil {
+			keyValues = append(keyValues, row)
+		}
+	}
+
+	for _, row := range keyValues {
+		sealed, err := secretStore.EncryptIfNeeded(row.keyValue)
+		if err != nil {
+			return err
+		}
+		if sealed == row.keyValue {
+			continue
+		}
+		if _, err := db.Exec(`
+			UPDATE encryption_keys
+			SET key_value=$3
+			WHERE key_name=$1 AND key_version=$2
+		`, row.keyName, row.keyVersion, sealed); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }

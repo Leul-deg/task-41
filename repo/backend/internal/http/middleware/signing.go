@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"io"
 	"net/http"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -38,6 +40,11 @@ func RequireSignedRequests(db *sql.DB) gin.HandlerFunc {
 		err = db.QueryRow(`SELECT secret FROM client_keys WHERE key_id=$1 AND revoked_at IS NULL`, clientKey).Scan(&secret)
 		if err != nil {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "unknown client key"})
+			return
+		}
+		secret, err = security.NewSecretStoreProtector(strings.TrimSpace(os.Getenv("SECRET_MASTER_KEY"))).DecryptIfNeeded(secret)
+		if err != nil || strings.TrimSpace(secret) == "" {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid client secret material"})
 			return
 		}
 
