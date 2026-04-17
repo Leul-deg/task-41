@@ -41,9 +41,17 @@ fi
 echo "=== Installing e2e dependencies ==="
 (cd "${E2E_DIR}" && npm install --prefer-offline --no-audit 2>&1) || fail_all "npm install failed"
 
+echo "=== Ensuring Playwright browser runtime is installed ==="
+if ! (cd "${E2E_DIR}" && npx playwright install --with-deps chromium >/dev/null 2>&1); then
+  if ! (cd "${E2E_DIR}" && npx playwright install chromium >/dev/null 2>&1); then
+    fail_all "playwright browser install failed"
+  fi
+fi
+
 echo "=== Running Playwright e2e tests ==="
 json_out="$(mktemp).json"
-(cd "${E2E_DIR}" && npx playwright test --reporter=json 2>/dev/null) >"${json_out}" 2>&1
+stderr_out="$(mktemp).log"
+(cd "${E2E_DIR}" && npx playwright test --reporter=json >"${json_out}" 2>"${stderr_out}")
 playwright_exit=$?
 
 if command -v python3 >/dev/null 2>&1 && [[ -s "${json_out}" ]]; then
@@ -82,18 +90,23 @@ if [[ "${TOTAL}" -eq 0 ]]; then
     print_result "e2e.playwright" "PASS" "" ""
   else
     TOTAL=1; PASSED=0; FAILED=1
-    snippet="$(tail -n 5 "${json_out}" 2>/dev/null | tr '\n' '|' | cut -c1-400)"
+    snippet="$(tail -n 12 "${stderr_out}" 2>/dev/null | tr '\n' '|' | cut -c1-400)"
+    if [[ -z "${snippet}" ]]; then
+      snippet="$(tail -n 5 "${json_out}" 2>/dev/null | tr '\n' '|' | cut -c1-400)"
+    fi
     print_result "e2e.playwright" "FAIL" "playwright exited ${playwright_exit}" "${snippet}"
   fi
 else
   if [[ ${playwright_exit} -eq 0 ]]; then
     print_result "e2e.playwright" "PASS" "" ""
   else
-    print_result "e2e.playwright" "FAIL" "playwright exited ${playwright_exit}" ""
+    snippet="$(tail -n 12 "${stderr_out}" 2>/dev/null | tr '\n' '|' | cut -c1-400)"
+    print_result "e2e.playwright" "FAIL" "playwright exited ${playwright_exit}" "${snippet}"
   fi
 fi
 
 rm -f "${json_out}"
+rm -f "${stderr_out}"
 
 echo "TOTAL=${TOTAL}"
 echo "PASSED=${PASSED}"
