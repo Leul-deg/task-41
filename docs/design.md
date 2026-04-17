@@ -173,6 +173,7 @@ PostgreSQL holds users, roles, permissions, scope rules, refresh/step-up tokens,
 - Gin default logging; audit middleware for write operations where enabled.
 - **Health:** `GET /healthz`.
 - **Worker** process runs jobs against the same DB (reservation expiry, retention, etc.)—see `repo/backend/cmd/worker`.
+- Test harness reliability is implemented in scripts: `repo/run_tests.sh` auto-starts Compose stack when services are unavailable, and `repo/e2e_tests/run_e2e_tests.sh` installs Playwright Chromium runtime before executing browser tests.
 
 ---
 

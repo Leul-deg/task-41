@@ -120,8 +120,8 @@ All routes: signing + JWT + permission/scope as noted.
 | `GET` | `/pipelines/templates/:id` | `hiring:view` | — | Get template |
 | `POST` | `/jobs` | `hiring:create` | global / site / assigned | Create job |
 | `POST` | `/applications/manual` | `hiring:create` | global / site / assigned | Manual application |
-| `POST` | `/applications/kiosk` | `hiring:create` | global / site / assigned | Staff kiosk intake |
-| `POST` | `/applications/import-csv` | `hiring:create` | — | CSV import |
+| `POST` | `/applications/kiosk` | `hiring:create` | global / site | Staff kiosk intake |
+| `POST` | `/applications/import-csv` | `hiring:create` | global / site / assigned | CSV import |
 | `POST` | `/pipelines/templates` | `hiring:update` | — | Create template |
 | `PUT` | `/pipelines/templates/:id` | `hiring:update` | — | Update template |
 | `POST` | `/pipelines/validate` | `hiring:update` | — | Validate definition (no DB write) |
